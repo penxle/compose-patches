@@ -218,11 +218,35 @@ jobs:
             package="$(jq -r '.package' <<< "$replacement")"
             version="$(jq -r '.version' <<< "$replacement")"
             endpoint="/orgs/$GITHUB_REPOSITORY_OWNER/packages/maven/$package/versions"
-            version_id="$(gh api --paginate --slurp "$endpoint?per_page=100" | jq -r --arg version "$version" '
+            if ! versions="$(gh api --paginate --slurp "$endpoint?per_page=100" 2>&1)"; then
+              if [[ "$versions" == *'(HTTP 404)'* ]]; then
+                echo "Already deleted: $package:$version"
+                continue
+              fi
+              printf '%s\n' "$versions" >&2
+              exit 1
+            fi
+
+            version_id="$(jq -r --arg version "$version" '
               [.[][] | select(.name == $version)] |
-              if length == 1 then .[0].id else error("expected exactly one matching package version") end
-            ')"
-            gh api --method DELETE "$endpoint/$version_id"
+              if length == 0 then empty
+              elif length == 1 then .[0].id
+              else error("expected at most one matching package version")
+              end
+            ' <<< "$versions")"
+            if [[ -z "$version_id" ]]; then
+              echo "Already deleted: $package:$version"
+              continue
+            fi
+
+            if ! delete_result="$(gh api --method DELETE "$endpoint/$version_id" 2>&1)"; then
+              if [[ "$delete_result" == *'(HTTP 404)'* ]]; then
+                echo "Already deleted: $package:$version"
+                continue
+              fi
+              printf '%s\n' "$delete_result" >&2
+              exit 1
+            fi
             echo "Deleted $package:$version"
           done < <(jq -c '.[]' <<< "$REPLACEMENTS")
 
