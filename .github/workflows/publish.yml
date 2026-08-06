@@ -181,6 +181,11 @@ jobs:
           path: upstream
           persist-credentials: false
 
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
       - name: Apply patches
         env:
           RELEASE: ${{ matrix.release }}
