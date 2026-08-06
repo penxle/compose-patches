@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Check out patch repository
-        uses: actions/checkout@v4.3.0
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -124,7 +124,7 @@ jobs:
             done < <(jq -c '.publications[]' "$manifest")
 
             if ((${#missing_tasks[@]} > 0)); then
-              tasks="$(jq -cn --args "${missing_tasks[@]}" '$ARGS.positional')"
+              tasks="$(jq -cn '$ARGS.positional' --args "${missing_tasks[@]}")"
               entry="$(jq -cn --arg release "$release" --arg provenance_sha256 "$provenance_sha256" \
                 --argjson publish_tasks "$tasks" --argjson replacements "$replacements" \
                 '{release: $release, provenance_sha256: $provenance_sha256, publish_tasks: $publish_tasks, replacements: $replacements}')"
@@ -154,7 +154,7 @@ jobs:
 
     steps:
       - name: Check out patch repository
-        uses: actions/checkout@v4.3.0
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -174,7 +174,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out upstream
-        uses: actions/checkout@v4.3.0
+        uses: actions/checkout@v6
         with:
           repository: ${{ steps.release.outputs.upstream_repository }}
           ref: ${{ steps.release.outputs.upstream_commit }}
