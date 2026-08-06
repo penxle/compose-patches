@@ -1,0 +1,26 @@
+{
+  "upstream_repository": "JetBrains/compose-multiplatform-core",
+  "upstream_commit": "2fbe09679fa51fc3f4a192047dcc7c4484f7adf7",
+  "version_property": "jetbrains.publication.version.COMPOSE",
+  "version": "1.12.0-beta03",
+  "patches": [
+    "ios-velocity-tracker.patch"
+  ],
+  "verify_args": [
+    ":compose:ui:ui:iosSimulatorArm64Test",
+    "--tests",
+    "androidx.compose.ui.input.pointer.util.PlatformVelocityTrackerIosTest"
+  ],
+  "publications": [
+    {
+      "group": "org.jetbrains.compose.ui",
+      "artifact": "ui-iosarm64",
+      "task": ":compose:ui:ui:publishIosArm64PublicationToGitHubPackagesRepository"
+    },
+    {
+      "group": "org.jetbrains.compose.ui",
+      "artifact": "ui-iossimulatorarm64",
+      "task": ":compose:ui:ui:publishIosSimulatorArm64PublicationToGitHubPackagesRepository"
+    }
+  ]
+}

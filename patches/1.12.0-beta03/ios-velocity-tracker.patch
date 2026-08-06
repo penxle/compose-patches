@@ -1,0 +1,226 @@
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/input/pointer/util/PlatformVelocityTracker.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/input/pointer/util/PlatformVelocityTracker.ios.kt
+index 9969104d0..20535d5de 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/input/pointer/util/PlatformVelocityTracker.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/input/pointer/util/PlatformVelocityTracker.ios.kt
+@@ -26,7 +26,6 @@ import androidx.compose.ui.util.fastForEach
+ internal actual fun PlatformVelocityTracker(): PlatformVelocityTracker = UIKitVelocityTracker()
+ 
+ private const val AssumePointerMoveStoppedMilliseconds: Int = 40
+-private const val MinimumGestureDurationSincePointerStop: Int = 50
+ private const val MinimumGestureDurationMilliseconds: Int = 100
+ 
+ private class UIKitVelocityTracker: PlatformVelocityTracker {
+@@ -34,7 +33,6 @@ private class UIKitVelocityTracker: PlatformVelocityTracker {
+     private val yVelocityTracker = PointerVelocityTracker1D(preventOppositeVelocity = true)
+     private var lastMoveEventTimeStamp = 0L
+     private var lastPointerStartEventTimeStamp = 0L
+-    private var lastPointerStopEventTimeStamp = 0L
+ 
+     override fun addPointerInputChange(event: PointerInputChange, offset: Offset) {
+         // If this is ACTION_DOWN: Reset the tracking.
+@@ -51,18 +49,14 @@ private class UIKitVelocityTracker: PlatformVelocityTracker {
+         // coordinates.
+         if (!event.changedToUpIgnoreConsumed()) {
+             event.historical.fastForEach {
+-                addPosition(it.uptimeMillis, it.position + offset)
++                addPosition(it.uptimeMillis, it.originalEventPosition + offset)
+             }
+-            addPosition(event.uptimeMillis, event.position + offset)
+-        }
+-
+-        if (event.uptimeMillis - lastMoveEventTimeStamp > AssumePointerMoveStoppedMilliseconds) {
+-            lastPointerStopEventTimeStamp = event.uptimeMillis
++            addPosition(event.uptimeMillis, event.originalEventPosition + offset)
+         }
+ 
+         if (event.changedToUpIgnoreConsumed() &&
+             event.uptimeMillis - lastPointerStartEventTimeStamp > MinimumGestureDurationMilliseconds &&
+-            event.uptimeMillis - lastPointerStopEventTimeStamp < MinimumGestureDurationSincePointerStop
++            event.uptimeMillis - lastMoveEventTimeStamp > AssumePointerMoveStoppedMilliseconds
+         ) {
+             resetTracking()
+         }
+diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/input/pointer/util/PlatformVelocityTrackerIosTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/input/pointer/util/PlatformVelocityTrackerIosTest.kt
+new file mode 100644
+index 000000000..42ad94ef3
+--- /dev/null
++++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/input/pointer/util/PlatformVelocityTrackerIosTest.kt
+@@ -0,0 +1,178 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package androidx.compose.ui.input.pointer.util
++
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.input.pointer.HistoricalChange
++import androidx.compose.ui.input.pointer.PointerId
++import androidx.compose.ui.input.pointer.PointerInputChange
++import androidx.compose.ui.input.pointer.PointerType
++import androidx.compose.ui.unit.Velocity
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertTrue
++
++class PlatformVelocityTrackerIosTest {
++    private val maximumVelocity = Velocity(Float.MAX_VALUE, Float.MAX_VALUE)
++
++    @Test
++    fun sparseCurrentEventsWithRecentMovementRetainVelocityOnUp() {
++        val tracker = PlatformVelocityTracker()
++        tracker.addSparseContinuousMovement()
++
++        assertTrue(tracker.calculateVelocity(maximumVelocity).x > 0f)
++
++        tracker.addPointerInputChange(up(timeMillis = 128L), Offset.Zero)
++
++        assertTrue(tracker.calculateVelocity(maximumVelocity).x > 0f)
++    }
++
++    @Test
++    fun movementFollowedByPauseClearsVelocityOnUp() {
++        val tracker = PlatformVelocityTracker()
++        tracker.addSparseContinuousMovement()
++
++        tracker.addPointerInputChange(up(timeMillis = 170L), Offset.Zero)
++
++        assertEquals(Velocity.Zero, tracker.calculateVelocity(maximumVelocity))
++    }
++
++    @Test
++    fun velocityOppositeToOverallMovementIsSuppressed() {
++        val tracker = PlatformVelocityTracker()
++        tracker.addPosition(0L, Offset(0f, 0f))
++        tracker.addPosition(10L, Offset(100f, 0f))
++        tracker.addPosition(20L, Offset(100f, 0f))
++        tracker.addPosition(30L, Offset(50f, 0f))
++
++        assertEquals(0f, tracker.calculateVelocity(maximumVelocity).x)
++    }
++
++    @Test
++    fun movingInputTargetUsesOriginalEventPositions() {
++        val tracker = PlatformVelocityTracker()
++        tracker.addPointerInputChange(
++            down(timeMillis = 0L),
++            Offset.Zero,
++        )
++        tracker.addPointerInputChange(
++            change(
++                timeMillis = 60L,
++                position = Offset.Zero,
++                originalEventPosition = Offset(-120f, 0f),
++                pressed = true,
++                previousPressed = true,
++                historical =
++                    listOf(
++                        sample(timeMillis = 20L, positionX = 0f, originalPositionX = -40f),
++                        sample(timeMillis = 40L, positionX = 0f, originalPositionX = -80f),
++                    ),
++            ),
++            Offset.Zero,
++        )
++
++        assertTrue(tracker.calculateVelocity(maximumVelocity).x < 0f)
++    }
++
++    private fun PlatformVelocityTracker.addSparseContinuousMovement() {
++        addPointerInputChange(down(timeMillis = 0L), Offset.Zero)
++        addPointerInputChange(
++            move(
++                timeMillis = 60L,
++                positionX = 60f,
++                historical = listOf(sample(20L, 20f), sample(40L, 40f)),
++            ),
++            Offset.Zero,
++        )
++        addPointerInputChange(
++            move(
++                timeMillis = 120L,
++                positionX = 120f,
++                historical = listOf(sample(80L, 80f), sample(100L, 100f)),
++            ),
++            Offset.Zero,
++        )
++    }
++
++    private fun sample(
++        timeMillis: Long,
++        positionX: Float,
++        originalPositionX: Float = positionX,
++    ) =
++        HistoricalChange(
++            uptimeMillis = timeMillis,
++            position = Offset(positionX, 0f),
++            scaleFactor = 1f,
++            panOffset = Offset.Zero,
++            originalEventPosition = Offset(originalPositionX, 0f),
++        )
++
++    private fun down(timeMillis: Long) =
++        change(
++            timeMillis = timeMillis,
++            position = Offset.Zero,
++            pressed = true,
++            previousPressed = false,
++        )
++
++    private fun move(
++        timeMillis: Long,
++        positionX: Float,
++        historical: List<HistoricalChange>,
++    ) =
++        change(
++            timeMillis = timeMillis,
++            position = Offset(positionX, 0f),
++            pressed = true,
++            previousPressed = true,
++            historical = historical,
++        )
++
++    private fun up(timeMillis: Long) =
++        change(
++            timeMillis = timeMillis,
++            position = Offset.Zero,
++            pressed = false,
++            previousPressed = true,
++        )
++
++    private fun change(
++        timeMillis: Long,
++        position: Offset,
++        originalEventPosition: Offset = position,
++        pressed: Boolean,
++        previousPressed: Boolean,
++        historical: List<HistoricalChange> = emptyList(),
++    ) =
++        PointerInputChange(
++            id = PointerId(0),
++            uptimeMillis = timeMillis,
++            position = position,
++            pressed = pressed,
++            pressure = 1f,
++            previousUptimeMillis = 0L,
++            previousPosition = Offset.Zero,
++            previousPressed = previousPressed,
++            isInitiallyConsumed = false,
++            type = PointerType.Touch,
++            historical = historical,
++            scrollDelta = Offset.Zero,
++            scaleFactor = 1f,
++            panOffset = Offset.Zero,
++            originalEventPosition = originalEventPosition,
++        )
++}
