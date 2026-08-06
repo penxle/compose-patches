@@ -1,0 +1,236 @@
+name: Publish Compose patch
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: compose-patches-publish
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_work: ${{ steps.discover.outputs.has_work }}
+      matrix: ${{ steps.discover.outputs.matrix }}
+
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Find unpublished or changed releases
+        id: discover
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s nullglob
+          manifests=(patches/*/release.json)
+          ((${#manifests[@]} > 0))
+
+          matrix='{"include":[]}'
+          declare -A seen_coordinates
+          pom_file="$(mktemp)"
+          trap 'rm -f "$pom_file"' EXIT
+
+          for manifest in "${manifests[@]}"; do
+            release="${manifest#patches/}"
+            release="${release%/release.json}"
+            [[ "$release" =~ ^[A-Za-z0-9._-]+$ ]]
+
+            jq -e '
+              type == "object" and
+              (.upstream_repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+              (.upstream_commit | type == "string" and test("^[0-9a-f]{40}$")) and
+              (.version_property | type == "string" and test("^[A-Za-z0-9_.-]+$")) and
+              (.version | type == "string" and test("^[A-Za-z0-9_.-]+$")) and
+              (.patches | type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_./-]+$") and (contains("..") | not))) and
+              (.verify_args | type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_.*:$=/-]+$"))) and
+              (.publications | type == "array" and length > 0 and all(.[];
+                type == "object" and
+                (.group | type == "string" and test("^[A-Za-z0-9_.-]+$")) and
+                (.artifact | type == "string" and test("^[A-Za-z0-9_.-]+$")) and
+                (.task | type == "string" and test("^(:[A-Za-z][A-Za-z0-9_-]*)+:publish[A-Za-z][A-Za-z0-9]*PublicationToGitHubPackagesRepository$"))
+              )) and
+              ([.publications[].task] | length == (unique | length)) and
+              ([.publications[] | .group + ":" + .artifact] | length == (unique | length))
+            ' "$manifest" > /dev/null
+
+            version="$(jq -r '.version' "$manifest")"
+            provenance_sha256="$(
+              {
+                jq -S -c . "$manifest"
+                while IFS= read -r patch; do
+                  path="patches/$release/$patch"
+                  test -f "$path"
+                  printf '\0%s\0' "$patch"
+                  cat "$path"
+                done < <(jq -r '.patches[]' "$manifest")
+              } | sha256sum | cut -d ' ' -f 1
+            )"
+            missing_tasks=()
+            replacements='[]'
+
+            while IFS= read -r publication; do
+              group="$(jq -r '.group' <<< "$publication")"
+              artifact="$(jq -r '.artifact' <<< "$publication")"
+              task="$(jq -r '.task' <<< "$publication")"
+              coordinate="$group:$artifact:$version"
+
+              if [[ -v "seen_coordinates[$coordinate]" ]]; then
+                echo "Duplicate publication coordinate: $coordinate" >&2
+                exit 1
+              fi
+              seen_coordinates[$coordinate]=1
+
+              group_path="${group//./\/}"
+              pom_url="https://maven.pkg.github.com/penxle/compose-patches/$group_path/$artifact/$version/$artifact-$version.pom"
+              status="$(curl --silent --show-error --location --output "$pom_file" --write-out '%{http_code}' \
+                --user "$GITHUB_ACTOR:$GITHUB_TOKEN" "$pom_url")"
+
+              case "$status" in
+                200)
+                  published_sha256="$(sed -n \
+                    's:.*<typie.patch.sha256>\([0-9a-f]\{64\}\)</typie.patch.sha256>.*:\1:p' "$pom_file")"
+                  if [[ "$published_sha256" == "$provenance_sha256" ]]; then
+                    echo "Already published with matching provenance: $coordinate"
+                  else
+                    echo "Replacing package with different provenance: $coordinate"
+                    missing_tasks+=("$task")
+                    replacement="$(jq -cn --arg package "$group.$artifact" --arg version "$version" \
+                      '{package: $package, version: $version}')"
+                    replacements="$(jq -c --argjson replacement "$replacement" '. += [$replacement]' <<< "$replacements")"
+                  fi
+                  ;;
+                404)
+                  echo "Missing: $coordinate"
+                  missing_tasks+=("$task")
+                  ;;
+                *)
+                  echo "Unable to check $coordinate: HTTP $status" >&2
+                  exit 1
+                  ;;
+              esac
+            done < <(jq -c '.publications[]' "$manifest")
+
+            if ((${#missing_tasks[@]} > 0)); then
+              tasks="$(jq -cn --args "${missing_tasks[@]}" '$ARGS.positional')"
+              entry="$(jq -cn --arg release "$release" --arg provenance_sha256 "$provenance_sha256" \
+                --argjson publish_tasks "$tasks" --argjson replacements "$replacements" \
+                '{release: $release, provenance_sha256: $provenance_sha256, publish_tasks: $publish_tasks, replacements: $replacements}')"
+              matrix="$(jq -c --argjson entry "$entry" '.include += [$entry]' <<< "$matrix")"
+            fi
+          done
+
+          if [[ "$(jq '.include | length' <<< "$matrix")" -gt 0 ]]; then
+            echo 'has_work=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has_work=false' >> "$GITHUB_OUTPUT"
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: discover
+    if: needs.discover.outputs.has_work == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Load release
+        id: release
+        env:
+          RELEASE: ${{ matrix.release }}
+        run: |
+          manifest="$GITHUB_WORKSPACE/patches/$RELEASE/release.json"
+          {
+            echo "upstream_repository=$(jq -r '.upstream_repository' "$manifest")"
+            echo "upstream_commit=$(jq -r '.upstream_commit' "$manifest")"
+            echo "version_property=$(jq -r '.version_property' "$manifest")"
+            echo "version=$(jq -r '.version' "$manifest")"
+            echo "patches=$(jq -c '.patches' "$manifest")"
+            echo "verify_args=$(jq -c '.verify_args' "$manifest")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out upstream
+        uses: actions/checkout@v4.3.0
+        with:
+          repository: ${{ steps.release.outputs.upstream_repository }}
+          ref: ${{ steps.release.outputs.upstream_commit }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Apply patches
+        env:
+          RELEASE: ${{ matrix.release }}
+          PATCHES: ${{ steps.release.outputs.patches }}
+          UPSTREAM_COMMIT: ${{ steps.release.outputs.upstream_commit }}
+        run: |
+          test "$(git -C upstream rev-parse HEAD)" = "$UPSTREAM_COMMIT"
+          while IFS= read -r patch; do
+            path="$GITHUB_WORKSPACE/patches/$RELEASE/$patch"
+            test -f "$path"
+            git -C upstream apply --check "$path"
+            git -C upstream apply "$path"
+          done < <(jq -r '.[]' <<< "$PATCHES")
+
+      - name: Verify patch
+        working-directory: upstream
+        env:
+          VERIFY_ARGS: ${{ steps.release.outputs.verify_args }}
+        run: |
+          args=()
+          while IFS= read -r arg; do args+=("$arg"); done < <(jq -r '.[]' <<< "$VERIFY_ARGS")
+          ./gradlew "${args[@]}" --no-configuration-cache --no-configure-on-demand
+
+      - name: Delete replaced package versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPLACEMENTS: ${{ toJSON(matrix.replacements) }}
+        run: |
+          while IFS= read -r replacement; do
+            package="$(jq -r '.package' <<< "$replacement")"
+            version="$(jq -r '.version' <<< "$replacement")"
+            endpoint="/orgs/$GITHUB_REPOSITORY_OWNER/packages/maven/$package/versions"
+            version_id="$(gh api --paginate --slurp "$endpoint?per_page=100" | jq -r --arg version "$version" '
+              [.[][] | select(.name == $version)] |
+              if length == 1 then .[0].id else error("expected exactly one matching package version") end
+            ')"
+            gh api --method DELETE "$endpoint/$version_id"
+            echo "Deleted $package:$version"
+          done < <(jq -c '.[]' <<< "$REPLACEMENTS")
+
+      - name: Publish patched artifacts
+        working-directory: upstream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PATCH_PROVENANCE_SHA256: ${{ matrix.provenance_sha256 }}
+          PUBLISH_TASKS: ${{ toJSON(matrix.publish_tasks) }}
+          VERSION: ${{ steps.release.outputs.version }}
+          VERSION_PROPERTY: ${{ steps.release.outputs.version_property }}
+        run: |
+          tasks=()
+          while IFS= read -r task; do tasks+=("$task"); done < <(jq -r '.[]' <<< "$PUBLISH_TASKS")
+          ./gradlew "${tasks[@]}" "-P$VERSION_PROPERTY=$VERSION" --no-configuration-cache --no-configure-on-demand \
+            -I "$GITHUB_WORKSPACE/gradle/publish.init.gradle.kts"
