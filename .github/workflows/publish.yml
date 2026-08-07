@@ -251,8 +251,9 @@ jobs:
           while IFS= read -r replacement; do
             package="$(jq -r '.package' <<< "$replacement")"
             version="$(jq -r '.version' <<< "$replacement")"
-            endpoint="/orgs/$GITHUB_REPOSITORY_OWNER/packages/maven/$package/versions"
-            if ! versions="$(gh api --paginate --slurp "$endpoint?per_page=100" 2>&1)"; then
+            package_endpoint="/orgs/$GITHUB_REPOSITORY_OWNER/packages/maven/$package"
+            versions_endpoint="$package_endpoint/versions"
+            if ! versions="$(gh api --paginate --slurp "$versions_endpoint?per_page=100" 2>&1)"; then
               if [[ "$versions" == *'(HTTP 404)'* ]]; then
                 echo "Already deleted: $package:$version"
                 continue
@@ -273,7 +274,14 @@ jobs:
               continue
             fi
 
-            if ! delete_result="$(gh api --method DELETE "$endpoint/$version_id" 2>&1)"; then
+            version_count="$(jq '[.[][]] | length' <<< "$versions")"
+            if [[ "$version_count" -eq 1 ]]; then
+              delete_endpoint="$package_endpoint"
+            else
+              delete_endpoint="$versions_endpoint/$version_id"
+            fi
+
+            if ! delete_result="$(gh api --method DELETE "$delete_endpoint" 2>&1)"; then
               if [[ "$delete_result" == *'(HTTP 404)'* ]]; then
                 echo "Already deleted: $package:$version"
                 continue
