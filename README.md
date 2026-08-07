@@ -2,18 +2,18 @@
 
 Compose patches used by [Typie](https://github.com/penxle/typie).
 
-- `patches/`: patches, provenance, and release configuration
+- `patches/`: independent patch files and provenance
+- `releases/`: ordered patch sets and publication configuration
 - `.github/workflows/publish.yml`: publishes missing or changed releases after a push to `main`
 - Maven registry: `https://maven.pkg.github.com/penxle/compose-patches`
 
 ## Adding a patch
 
-Add a directory under `patches/` containing the patch files, a short README, and a `release.json`. Copy an existing `release.json` and update:
+Add `patches/<patch-id>` containing a short README, `patch.json`, and the patch files. `patch.json` records the upstream repository, commit, version,
+files, and focused verification commands.
 
-- the upstream repository, commit, version property, and version;
-- `patches`, in application order;
-- `verify_args`, passed to the upstream Gradle wrapper;
-- `publications`, with each Maven coordinate and its GitHub Packages publication task.
+Adding a patch does not publish it. Add its ID to `releases/<version>/release.json` in application order when it should be included in the published
+artifacts.
 
 Merge the change into `main`. The workflow publishes missing publications and replaces publications whose release configuration or patch contents have
 changed.

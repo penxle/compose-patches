@@ -35,27 +35,28 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           shopt -s nullglob
-          manifests=(patches/*/release.json)
+          manifests=(releases/*/release.json)
           ((${#manifests[@]} > 0))
 
           matrix='{"include":[]}'
-          declare -A seen_coordinates
+          seen_coordinates=()
           pom_file="$(mktemp)"
           trap 'rm -f "$pom_file"' EXIT
 
           for manifest in "${manifests[@]}"; do
-            release="${manifest#patches/}"
+            release="${manifest#releases/}"
             release="${release%/release.json}"
-            [[ "$release" =~ ^[A-Za-z0-9._-]+$ ]]
+            [[ "$release" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
 
             jq -e '
               type == "object" and
               (.upstream_repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
               (.upstream_commit | type == "string" and test("^[0-9a-f]{40}$")) and
               (.version_property | type == "string" and test("^[A-Za-z0-9_.-]+$")) and
-              (.version | type == "string" and test("^[A-Za-z0-9_.-]+$")) and
-              (.patches | type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_./-]+$") and (contains("..") | not))) and
-              (.verify_args | type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_.*:$=/-]+$"))) and
+              (.version | type == "string" and . == $release) and
+              (.patches | type == "array" and length > 0 and
+                all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+                length == (unique | length)) and
               (.publications | type == "array" and length > 0 and all(.[];
                 type == "object" and
                 (.group | type == "string" and test("^[A-Za-z0-9_.-]+$")) and
@@ -64,17 +65,41 @@ jobs:
               )) and
               ([.publications[].task] | length == (unique | length)) and
               ([.publications[] | .group + ":" + .artifact] | length == (unique | length))
-            ' "$manifest" > /dev/null
+            ' --arg release "$release" "$manifest" > /dev/null
 
+            upstream_repository="$(jq -r '.upstream_repository' "$manifest")"
+            upstream_commit="$(jq -r '.upstream_commit' "$manifest")"
             version="$(jq -r '.version' "$manifest")"
             provenance_sha256="$(
               {
                 jq -S -c . "$manifest"
-                while IFS= read -r patch; do
-                  path="patches/$release/$patch"
-                  test -f "$path"
-                  printf '\0%s\0' "$patch"
-                  cat "$path"
+                while IFS= read -r patch_id; do
+                  patch_manifest="patches/$patch_id/patch.json"
+                  test -f "patches/$patch_id/README.md"
+                  jq -e '
+                    type == "object" and
+                    (.upstream_repository == $upstream_repository) and
+                    (.upstream_commit == $upstream_commit) and
+                    (.version == $version) and
+                    (.files | type == "array" and length > 0 and
+                      all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*\\.patch$")) and
+                      length == (unique | length)) and
+                    (.verify_commands | type == "array" and length > 0 and
+                      all(.[]; type == "array" and length > 0 and
+                        all(.[]; type == "string" and length > 0)))
+                  ' --arg upstream_repository "$upstream_repository" \
+                    --arg upstream_commit "$upstream_commit" \
+                    --arg version "$version" \
+                    "$patch_manifest" > /dev/null
+
+                  printf '\0%s\0' "$patch_id"
+                  jq -S -c . "$patch_manifest"
+                  while IFS= read -r patch_file; do
+                    path="patches/$patch_id/$patch_file"
+                    test -f "$path"
+                    printf '\0%s\0' "$patch_file"
+                    cat "$path"
+                  done < <(jq -r '.files[]' "$patch_manifest")
                 done < <(jq -r '.patches[]' "$manifest")
               } | sha256sum | cut -d ' ' -f 1
             )"
@@ -87,11 +112,13 @@ jobs:
               task="$(jq -r '.task' <<< "$publication")"
               coordinate="$group:$artifact:$version"
 
-              if [[ -v "seen_coordinates[$coordinate]" ]]; then
-                echo "Duplicate publication coordinate: $coordinate" >&2
-                exit 1
-              fi
-              seen_coordinates[$coordinate]=1
+              for seen_coordinate in "${seen_coordinates[@]}"; do
+                if [[ "$seen_coordinate" == "$coordinate" ]]; then
+                  echo "Duplicate publication coordinate: $coordinate" >&2
+                  exit 1
+                fi
+              done
+              seen_coordinates+=("$coordinate")
 
               group_path="${group//./\/}"
               pom_url="https://maven.pkg.github.com/penxle/compose-patches/$group_path/$artifact/$version/$artifact-$version.pom"
@@ -163,14 +190,13 @@ jobs:
         env:
           RELEASE: ${{ matrix.release }}
         run: |
-          manifest="$GITHUB_WORKSPACE/patches/$RELEASE/release.json"
+          manifest="$GITHUB_WORKSPACE/releases/$RELEASE/release.json"
           {
             echo "upstream_repository=$(jq -r '.upstream_repository' "$manifest")"
             echo "upstream_commit=$(jq -r '.upstream_commit' "$manifest")"
             echo "version_property=$(jq -r '.version_property' "$manifest")"
             echo "version=$(jq -r '.version' "$manifest")"
             echo "patches=$(jq -c '.patches' "$manifest")"
-            echo "verify_args=$(jq -c '.verify_args' "$manifest")"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out upstream
@@ -193,21 +219,29 @@ jobs:
           UPSTREAM_COMMIT: ${{ steps.release.outputs.upstream_commit }}
         run: |
           test "$(git -C upstream rev-parse HEAD)" = "$UPSTREAM_COMMIT"
-          while IFS= read -r patch; do
-            path="$GITHUB_WORKSPACE/patches/$RELEASE/$patch"
-            test -f "$path"
-            git -C upstream apply --check "$path"
-            git -C upstream apply "$path"
+          while IFS= read -r patch_id; do
+            manifest="$GITHUB_WORKSPACE/patches/$patch_id/patch.json"
+            while IFS= read -r patch_file; do
+              path="$GITHUB_WORKSPACE/patches/$patch_id/$patch_file"
+              test -f "$path"
+              git -C upstream apply --check "$path"
+              git -C upstream apply "$path"
+            done < <(jq -r '.files[]' "$manifest")
           done < <(jq -r '.[]' <<< "$PATCHES")
 
-      - name: Verify patch
+      - name: Verify patches
         working-directory: upstream
         env:
-          VERIFY_ARGS: ${{ steps.release.outputs.verify_args }}
+          PATCHES: ${{ steps.release.outputs.patches }}
         run: |
-          args=()
-          while IFS= read -r arg; do args+=("$arg"); done < <(jq -r '.[]' <<< "$VERIFY_ARGS")
-          ./gradlew "${args[@]}" --no-configuration-cache --no-configure-on-demand
+          while IFS= read -r patch_id; do
+            manifest="$GITHUB_WORKSPACE/patches/$patch_id/patch.json"
+            while IFS= read -r command; do
+              args=()
+              while IFS= read -r arg; do args+=("$arg"); done < <(jq -r '.[]' <<< "$command")
+              ./gradlew "${args[@]}" --no-configuration-cache --no-configure-on-demand
+            done < <(jq -c '.verify_commands[]' "$manifest")
+          done < <(jq -r '.[]' <<< "$PATCHES")
 
       - name: Delete replaced package versions
         env:

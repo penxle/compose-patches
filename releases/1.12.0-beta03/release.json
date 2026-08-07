@@ -4,12 +4,7 @@
   "version_property": "jetbrains.publication.version.COMPOSE",
   "version": "1.12.0-beta03",
   "patches": [
-    "ios-velocity-tracker.patch"
-  ],
-  "verify_args": [
-    ":compose:ui:ui:iosSimulatorArm64Test",
-    "--tests",
-    "androidx.compose.ui.input.pointer.util.PlatformVelocityTrackerIosTest"
+    "ios-velocity-tracker"
   ],
   "publications": [
     {

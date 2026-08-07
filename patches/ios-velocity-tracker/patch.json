@@ -1,0 +1,15 @@
+{
+  "upstream_repository": "JetBrains/compose-multiplatform-core",
+  "upstream_commit": "2fbe09679fa51fc3f4a192047dcc7c4484f7adf7",
+  "version": "1.12.0-beta03",
+  "files": [
+    "ios-velocity-tracker.patch"
+  ],
+  "verify_commands": [
+    [
+      ":compose:ui:ui:iosSimulatorArm64Test",
+      "--tests",
+      "androidx.compose.ui.input.pointer.util.PlatformVelocityTrackerIosTest"
+    ]
+  ]
+}
