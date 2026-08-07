@@ -1,0 +1,474 @@
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+index b558cd47..c0a928c0 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+@@ -42,8 +42,10 @@ import kotlin.math.absoluteValue
+ import kotlin.math.min
+ import kotlin.time.Duration.Companion.milliseconds
+ import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Job
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.yield
+ import org.jetbrains.skia.BreakIterator
+ import platform.UIKit.UIView
+ 
+@@ -68,16 +70,19 @@ internal abstract class TextInputConnection(
+ 
+     private var floatingCursorTranslation : Offset? = null
+     private var currentRequest: PlatformTextInputMethodRequest? = null
++    private val pendingEditCommands = mutableListOf<EditCommand>()
++    private var editFlushJob: Job? = null
+ 
+     protected abstract val textInputView: UIView
+     protected var currentTextFieldValue: TextFieldValue? = null
+-        private set
++        protected set
+ 
+     protected val textLayoutResult get() = currentRequest?.textLayoutResult()
+     protected val unclippedTextOffsetInRoot get() = currentRequest?.unclippedTextOffsetInRoot()
+     protected val textFieldRectInRoot get() = currentRequest?.textFieldRectInRoot()
+ 
+     fun start(request: PlatformTextInputMethodRequest) {
++        clearPendingEdits()
+         currentRequest = request
+         currentTextFieldValue = request.stateSnapshot()
+         inputTraits = getUITextInputTraits(request.imeOptions)
+@@ -88,6 +93,7 @@ internal abstract class TextInputConnection(
+     protected abstract fun attachInputToView()
+ 
+     open fun stop() {
++        clearPendingEdits()
+         currentRequest = null
+         currentTextFieldValue = null
+         inputTraits = EmptyInputTraits
+@@ -108,13 +114,24 @@ internal abstract class TextInputConnection(
+     }
+ 
+     open fun onTextFieldValueUpdated(newValue: TextFieldValue) {
++        // A snapshot emitted before the pending UIKit callbacks have been flushed still describes
++        // the pre-edit state. Keep the predicted value so subsequent callbacks in the batch see
++        // the selection and composition produced by the preceding callbacks.
++        if (pendingEditCommands.isNotEmpty()) {
++            return
++        }
+         if (postponeSelectionUpdate) {
+             currentTextFieldValue = newValue
+             return
+         }
+         val internalOldValue = currentTextFieldValue
+-        val textChanged = internalOldValue == null || internalOldValue.text != newValue.text
+-        val selectionChanged = textChanged || internalOldValue.selection != newValue.selection
++        val compositionChanged = internalOldValue?.composition != newValue.composition
++        val textChanged =
++            internalOldValue == null ||
++                internalOldValue.text != newValue.text ||
++                compositionChanged
++        val selectionChanged =
++            textChanged || internalOldValue.selection != newValue.selection
+ 
+         stateWillChange(textChanged, selectionChanged)
+         currentTextFieldValue = newValue
+@@ -206,17 +223,57 @@ internal abstract class TextInputConnection(
+         requireUpdateView: Boolean = true,
+         performCommand: TextEditingScope.() -> Unit
+     ) {
+-        currentRequest?.let {
+-            postponeSelectionUpdate = true
+-            it.editText {
+-                performCommand()
++        val request = currentRequest ?: return
++        val currentValue = currentTextFieldValue ?: request.stateSnapshot()
++        val commands = recordEditCommands(performCommand)
++        if (commands.isEmpty()) return
++
++        pendingEditCommands += commands
++        currentTextFieldValue =
++            EditProcessor().also { it.reset(currentValue, null) }.apply(commands)
++        if (requireUpdateView) {
++            updateView()
++        }
++        if (editFlushJob == null) {
++            editFlushJob = coroutineScope.launch {
++                yield()
++                flushPendingEdits()
+             }
+-            if (requireUpdateView) {
+-                updateView()
++        }
++    }
++
++    private fun flushPendingEdits() {
++        editFlushJob = null
++        val request = currentRequest ?: return clearPendingEdits()
++        if (pendingEditCommands.isEmpty()) return
++
++        val commands = pendingEditCommands.toList()
++        pendingEditCommands.clear()
++        val expectedValue = currentTextFieldValue ?: request.stateSnapshot()
++        postponeSelectionUpdate = true
++        try {
++            request.editText {
++                commands.forEach(::applyEditCommand)
+             }
+-            onTextFieldValueUpdated(it.stateSnapshot())
++        } finally {
+             postponeSelectionUpdate = false
+         }
++
++        val actualValue = request.stateSnapshot()
++        if (actualValue == expectedValue) {
++            currentTextFieldValue = actualValue
++        } else {
++            // Restore the value UIKit expects before notifying its delegate about the
++            // externally transformed result (for example, an application text replacement).
++            currentTextFieldValue = expectedValue
++            onTextFieldValueUpdated(actualValue)
++        }
++    }
++
++    private fun clearPendingEdits() {
++        editFlushJob?.cancel()
++        editFlushJob = null
++        pendingEditCommands.clear()
+     }
+ 
+     private fun imeActionRequired(): Boolean =
+@@ -453,5 +510,59 @@ internal abstract class TextInputConnection(
+     }
+ }
+ 
++private fun recordEditCommands(
++    block: TextEditingScope.() -> Unit
++): List<EditCommand> = buildList {
++    object : TextEditingScope {
++        override fun deleteSurroundingTextInCodePoints(
++            lengthBeforeCursor: Int,
++            lengthAfterCursor: Int,
++        ) {
++            add(
++                DeleteSurroundingTextInCodePointsCommand(
++                    lengthBeforeCursor,
++                    lengthAfterCursor,
++                )
++            )
++        }
++
++        override fun setSelection(start: Int, end: Int) {
++            add(SetSelectionCommand(start, end))
++        }
++
++        override fun commitText(text: CharSequence, newCursorPosition: Int) {
++            add(CommitTextCommand(text.toString(), newCursorPosition))
++        }
++
++        override fun setComposingRegion(start: Int, end: Int) {
++            add(SetComposingRegionCommand(start, end))
++        }
++
++        override fun setComposingText(text: CharSequence, newCursorPosition: Int) {
++            add(SetComposingTextCommand(text.toString(), newCursorPosition))
++        }
++
++        override fun finishComposingText() {
++            add(FinishComposingTextCommand())
++        }
++    }.block()
++}
++
++private fun TextEditingScope.applyEditCommand(command: EditCommand) {
++    when (command) {
++        is DeleteSurroundingTextInCodePointsCommand ->
++            deleteSurroundingTextInCodePoints(
++                command.lengthBeforeCursor,
++                command.lengthAfterCursor,
++            )
++        is SetSelectionCommand -> setSelection(command.start, command.end)
++        is CommitTextCommand -> commitText(command.text, command.newCursorPosition)
++        is SetComposingRegionCommand -> setComposingRegion(command.start, command.end)
++        is SetComposingTextCommand -> setComposingText(command.text, command.newCursorPosition)
++        is FinishComposingTextCommand -> finishComposingText()
++        else -> error("Unsupported edit command: $command")
++    }
++}
++
+ internal fun PlatformTextInputMethodRequest.stateSnapshot() =
+     TextFieldValue(state.text, state.selection, state.composition)
+diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
+new file mode 100644
+index 00000000..adef415a
+--- /dev/null
++++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
+@@ -0,0 +1,272 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package androidx.compose.ui.text.input
++
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Rect
++import androidx.compose.ui.platform.PlatformTextInputMethodRequest
++import androidx.compose.ui.text.TextLayoutResult
++import androidx.compose.ui.text.TextRange
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlinx.cinterop.ExperimentalForeignApi
++import kotlinx.cinterop.readValue
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.runCurrent
++import kotlinx.coroutines.test.runTest
++import platform.CoreGraphics.CGRectZero
++import platform.UIKit.UIView
++
++@OptIn(ExperimentalForeignApi::class, ExperimentalCoroutinesApi::class)
++class TextInputConnectionIosTest {
++    @Test
++    fun nativeEditsInTheSameTurnAreDispatchedAsOneEdit() = runTest {
++        val request = TestRequest(TextFieldValue("ab", TextRange(2)))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        connection.setSelectedTextRange(TextRange(0, 2))
++        connection.insertText("c")
++
++        assertEquals(emptyList(), request.dispatchedCommands)
++
++        runCurrent()
++
++        assertEquals(
++            listOf(
++                listOf(
++                    SetSelectionCommand(0, 2),
++                    CommitTextCommand("c", 1),
++                )
++            ),
++            request.dispatchedCommands,
++        )
++        assertEquals(TextFieldValue("c", TextRange(1)), request.value())
++        assertEquals(emptyList(), connection.stateWillChanges)
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun externallyRewrittenEditNotifiesTheNativeTextInputDelegate() = runTest {
++        val request = TestRequest(TextFieldValue())
++        request.resultOverride = TextFieldValue("!!!", TextRange(3))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        connection.insertText("ㅇ")
++
++        assertEquals("ㅇ", connection.textInRange(TextRange(0, 1)))
++
++        runCurrent()
++
++        assertEquals("!!!", connection.textInRange(TextRange(0, 3)))
++        assertEquals(listOf(true to true), connection.stateWillChanges)
++        assertEquals(listOf(true to true), connection.stateDidChanges)
++    }
++
++    @Test
++    fun externallyCommittedCompositionNotifiesTheNativeTextInputDelegate() = runTest {
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(
++            TestRequest(
++                TextFieldValue(
++                    text = "하",
++                    selection = TextRange(1),
++                    composition = TextRange(0, 1),
++                )
++            )
++        )
++
++        connection.onTextFieldValueUpdated(
++            TextFieldValue(
++                text = "하",
++                selection = TextRange(1),
++                composition = null,
++            )
++        )
++
++        assertEquals(listOf(true to true), connection.stateWillChanges)
++        assertEquals(listOf(true to true), connection.stateDidChanges)
++    }
++
++    @Test
++    fun staleStateUpdateDoesNotReplaceThePendingNativeEditPrediction() = runTest {
++        val initialValue = TextFieldValue()
++        val request = TestRequest(initialValue)
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        connection.insertText("c")
++        connection.onTextFieldValueUpdated(initialValue)
++        connection.insertText("d")
++
++        assertEquals("cd", connection.textInRange(TextRange(0, 2)))
++
++        runCurrent()
++
++        assertEquals(TextFieldValue("cd", TextRange(2)), request.value())
++        assertEquals(emptyList(), connection.stateWillChanges)
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun stoppingTheConnectionDiscardsPendingNativeEdits() = runTest {
++        val request = TestRequest(TextFieldValue())
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        connection.insertText("a")
++        connection.stop()
++
++        runCurrent()
++
++        assertEquals(emptyList(), request.dispatchedCommands)
++        assertEquals(TextFieldValue(), request.value())
++    }
++}
++
++@OptIn(ExperimentalForeignApi::class)
++private class TestTextInputConnection(
++    scope: CoroutineScope,
++) : TextInputConnection(
++    updateView = {},
++    view = UIView(frame = CGRectZero.readValue()),
++    coroutineScope = scope,
++    focusedViewsList = null,
++    focusManager = { null },
++) {
++    val stateWillChanges = mutableListOf<Pair<Boolean, Boolean>>()
++    val stateDidChanges = mutableListOf<Pair<Boolean, Boolean>>()
++
++    override val textInputView: UIView
++        get() = view
++
++    override fun attachInputToView() = Unit
++
++    override fun detachView() = Unit
++
++    override fun showKeyboard() = Unit
++
++    override fun dismissKeyboard() = Unit
++
++    override fun stateWillChange(textChanged: Boolean, selectionChanged: Boolean) {
++        stateWillChanges += textChanged to selectionChanged
++    }
++
++    override fun stateDidChange(textChanged: Boolean, selectionChanged: Boolean) {
++        stateDidChanges += textChanged to selectionChanged
++    }
++
++    override fun onViewGeometryUpdated() = Unit
++
++    override fun setAvailableEditMenuActions(
++        copy: (() -> Unit)?,
++        paste: (() -> Unit)?,
++        cut: (() -> Unit)?,
++        selectAll: (() -> Unit)?,
++        customActions: List<androidx.compose.ui.platform.UIKitNativeTextInputContextMenuCustomAction>?,
++    ) = Unit
++}
++
++private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMethodRequest {
++    private var fieldValue = initialValue
++
++    val dispatchedCommands = mutableListOf<List<EditCommand>>()
++    var resultOverride: TextFieldValue? = null
++
++    override val value: () -> TextFieldValue = { fieldValue }
++
++    override val state: TextEditorState =
++        object : TextEditorState {
++            override val selection: TextRange
++                get() = fieldValue.selection
++
++            override val composition: TextRange?
++                get() = fieldValue.composition
++
++            override val text: String
++                get() = fieldValue.text
++
++            override val length: Int
++                get() = fieldValue.text.length
++
++            override fun get(index: Int): Char = fieldValue.text[index]
++
++            override fun subSequence(startIndex: Int, endIndex: Int): CharSequence =
++                fieldValue.text.subSequence(startIndex, endIndex)
++        }
++
++    override val imeOptions: ImeOptions = ImeOptions.Default
++
++    override val onEditCommand: (List<EditCommand>) -> Unit = {}
++
++    override val onImeAction: ((ImeAction) -> Unit)? = null
++
++    override val textLayoutResult: () -> TextLayoutResult? = { null }
++
++    override val focusedRectInRoot: () -> Rect? = { null }
++
++    override val textFieldRectInRoot: () -> Rect? = { null }
++
++    override val textClippingRectInRoot: () -> Rect? = { null }
++
++    override val unclippedTextOffsetInRoot: () -> Offset? = { null }
++
++    override val editText: (block: TextEditingScope.() -> Unit) -> Unit = { block ->
++        val commands = mutableListOf<EditCommand>()
++        TestTextEditingScope(commands).block()
++        dispatchedCommands += commands
++        fieldValue =
++            resultOverride
++                ?: EditProcessor().also { it.reset(fieldValue, null) }.apply(commands)
++    }
++}
++
++private fun TestTextEditingScope(commands: MutableList<EditCommand>) =
++    object : TextEditingScope {
++        override fun deleteSurroundingTextInCodePoints(
++            lengthBeforeCursor: Int,
++            lengthAfterCursor: Int,
++        ) {
++            commands +=
++                DeleteSurroundingTextInCodePointsCommand(
++                    lengthBeforeCursor,
++                    lengthAfterCursor,
++                )
++        }
++
++        override fun setSelection(start: Int, end: Int) {
++            commands += SetSelectionCommand(start, end)
++        }
++
++        override fun commitText(text: CharSequence, newCursorPosition: Int) {
++            commands += CommitTextCommand(text.toString(), newCursorPosition)
++        }
++
++        override fun setComposingRegion(start: Int, end: Int) {
++            commands += SetComposingRegionCommand(start, end)
++        }
++
++        override fun setComposingText(text: CharSequence, newCursorPosition: Int) {
++            commands += SetComposingTextCommand(text.toString(), newCursorPosition)
++        }
++
++        override fun finishComposingText() {
++            commands += FinishComposingTextCommand()
++        }
++    }
