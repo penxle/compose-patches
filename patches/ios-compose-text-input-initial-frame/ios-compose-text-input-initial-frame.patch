@@ -1,0 +1,17 @@
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
+index d8e785166a4..23683ee8340 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
+@@ -65,11 +65,9 @@ internal open class ComposeTextInputConnection(
+         }
+ 
+     override fun attachInputToView() {
++        onViewGeometryUpdated()
+         view.addSubview(textInputView)
+-        textInputView.setFrame(view.bounds)
+-
+         textInputView.input = this
+-        onViewGeometryUpdated()
+     }
+ 
+     override fun detachView() {
