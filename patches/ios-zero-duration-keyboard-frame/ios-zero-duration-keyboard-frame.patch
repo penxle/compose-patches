@@ -1,0 +1,84 @@
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeSceneKeyboardOffsetManager.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeSceneKeyboardOffsetManager.ios.kt
+index fe51e9944414584d584cbc82eac5b55069f987b0..3b4a7c644fe8156fb45e4d443c0ed796fd8cff9e 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeSceneKeyboardOffsetManager.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeSceneKeyboardOffsetManager.ios.kt
+@@ -149,7 +149,7 @@ internal class ComposeSceneKeyboardOffsetManager(
+             keyboardOverlapHeightChanged(max(0.0, currentHeight - viewBottomIndent).dp)
+         }
+ 
+-        if (previousKeyboardHeight == keyboardHeight) {
++        if (duration == 0.0 || previousKeyboardHeight == keyboardHeight) {
+             updateAnimationValues(1.0)
+             return
+         }
+diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/window/ComposeSceneKeyboardOffsetManagerTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/window/ComposeSceneKeyboardOffsetManagerTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6ce918ef097965a4e2147bb6988e86a23e28fd4
+--- /dev/null
++++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/window/ComposeSceneKeyboardOffsetManagerTest.kt
+@@ -0,0 +1,65 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package androidx.compose.ui.window
++
++import androidx.compose.ui.unit.dp
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlinx.cinterop.ExperimentalForeignApi
++import kotlinx.cinterop.useContents
++import platform.CoreGraphics.CGRectMake
++import platform.Foundation.NSDate
++import platform.Foundation.NSRunLoop
++import platform.Foundation.dateWithTimeIntervalSinceNow
++import platform.Foundation.runUntilDate
++import platform.UIKit.UIScreen
++import platform.UIKit.UIView
++import platform.UIKit.UIViewAnimationOptionCurveLinear
++import platform.UIKit.UIWindow
++
++@OptIn(ExperimentalForeignApi::class)
++class ComposeSceneKeyboardOffsetManagerTest {
++    @Test
++    fun zeroDurationKeyboardFrameIsAppliedSynchronously() {
++        val screenBounds = UIScreen.mainScreen.bounds
++        val window = UIWindow(frame = screenBounds)
++        val view = UIView(frame = screenBounds)
++        window.addSubview(view)
++        var overlap = (-1).dp
++        val manager = ComposeSceneKeyboardOffsetManager(view) { overlap = it }
++        val targetHeight = 200.0
++        val targetFrame = screenBounds.useContents {
++            CGRectMake(0.0, size.height - targetHeight, maxOf(1.0, size.width), targetHeight)
++        }
++
++        manager.keyboardWillChangeFrame(
++            targetFrame = targetFrame,
++            duration = 0.0,
++            animationOptions = UIViewAnimationOptionCurveLinear
++        )
++        val appliedSynchronously = overlap
++        val startedAnimation = manager.isAnimating
++
++        NSRunLoop.currentRunLoop.runUntilDate(NSDate.dateWithTimeIntervalSinceNow(0.1))
++        manager.dispose()
++        window.hidden = true
++
++        assertEquals(targetHeight.dp, appliedSynchronously)
++        assertFalse(startedAnimation)
++    }
++}

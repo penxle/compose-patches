@@ -6,7 +6,8 @@
   "patches": [
     "ios-velocity-tracker",
     "ios-text-input-edit-batching",
-    "ios-compose-text-input-initial-frame"
+    "ios-compose-text-input-initial-frame",
+    "ios-zero-duration-keyboard-frame"
   ],
   "publications": [
     {
