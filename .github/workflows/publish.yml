@@ -169,7 +169,7 @@ jobs:
   publish:
     needs: discover
     if: needs.discover.outputs.has_work == 'true'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -206,6 +206,14 @@ jobs:
           ref: ${{ steps.release.outputs.upstream_commit }}
           path: upstream
           persist-credentials: false
+
+      - name: Select Xcode
+        run: |
+          # Compose 1.12.0 compiles CMPUIKitUtils against unguarded iOS 26 SDK symbols, so the
+          # image default Xcode is not enough. Upstream selects the same toolchain explicitly in
+          # .github/actions/setup-xcode.
+          sudo xcode-select -s /Applications/Xcode_26.5.app
+          xcodebuild -version
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
