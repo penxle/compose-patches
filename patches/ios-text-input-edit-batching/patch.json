@@ -1,7 +1,7 @@
 {
   "upstream_repository": "JetBrains/compose-multiplatform-core",
-  "upstream_commit": "2fbe09679fa51fc3f4a192047dcc7c4484f7adf7",
-  "version": "1.12.0-beta03",
+  "upstream_commit": "f29d2f99f3beafc60992c6a73dbbaa9f841c5d4c",
+  "version": "1.12.0",
   "files": [
     "ios-text-input-edit-batching.patch"
   ],

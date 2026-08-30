@@ -1,8 +1,8 @@
 {
   "upstream_repository": "JetBrains/compose-multiplatform-core",
-  "upstream_commit": "2fbe09679fa51fc3f4a192047dcc7c4484f7adf7",
+  "upstream_commit": "f29d2f99f3beafc60992c6a73dbbaa9f841c5d4c",
   "version_property": "jetbrains.publication.version.COMPOSE",
-  "version": "1.12.0-beta03",
+  "version": "1.12.0",
   "patches": [
     "ios-velocity-tracker",
     "ios-text-input-edit-batching",
