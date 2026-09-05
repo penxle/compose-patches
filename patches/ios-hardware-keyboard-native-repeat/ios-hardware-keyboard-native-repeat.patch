@@ -1,0 +1,808 @@
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputService.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputService.ios.kt
+index fccd9989d2a..19e6f16594d 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputService.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputService.ios.kt
+@@ -56,6 +56,7 @@ internal class UIKitTextInputService(
+     private val focusedViewsList: FocusedViewsList?,
+     private var onInputStarted: () -> Unit,
+     private var focusManager: () -> ComposeSceneFocusManager?,
++    private val onHardwareKeyRepeat: (KeyEvent) -> Unit,
+     coroutineContext: CoroutineContext
+ ) {
+ 
+@@ -107,6 +108,7 @@ internal class UIKitTextInputService(
+                 coroutineScope = coroutineScope,
+                 focusedViewsList = focusedViewsList,
+                 focusManager = focusManager,
++                onHardwareKeyRepeat = onHardwareKeyRepeat,
+             )
+         } else {
+             ComposeTextInputConnection(
+@@ -115,7 +117,8 @@ internal class UIKitTextInputService(
+                 coroutineScope = coroutineScope,
+                 viewConfiguration = viewConfiguration,
+                 focusedViewsList = focusedViewsList,
+-                focusManager = focusManager
++                focusManager = focusManager,
++                onHardwareKeyRepeat = onHardwareKeyRepeat,
+             )
+         }
+         currentInputConnection?.start(request)
+@@ -139,6 +142,19 @@ internal class UIKitTextInputService(
+     fun onPreviewKeyEvent(event: KeyEvent): Boolean =
+         currentInputConnection?.onPreviewKeyEvent(event) ?: false
+ 
++    val hasActiveComposition: Boolean
++        get() = currentInputConnection?.hasActiveComposition == true
++
++    fun beginHardwareKeyboardRepeat(event: KeyEvent): Boolean =
++        currentInputConnection?.beginHardwareKeyboardRepeat(event) == true
++
++    fun endHardwareKeyboardRepeat(): Boolean =
++        currentInputConnection?.endHardwareKeyboardRepeat() == true
++
++    fun resetHardwareKeyboardRepeat() {
++        currentInputConnection?.resetHardwareKeyboardRepeat()
++    }
++
+     val textToolbar: TextToolbar by lazy(LazyThreadSafetyMode.NONE) {
+         object : TextToolbar {
+             override val status: TextToolbarStatus
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/scene/ComposeSceneMediator.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/scene/ComposeSceneMediator.ios.kt
+index ab15ad1e92f..41566f0f76f 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/scene/ComposeSceneMediator.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/scene/ComposeSceneMediator.ios.kt
+@@ -311,10 +311,12 @@ internal class ComposeSceneMediator(
+         onCancelScroll = ::onCancelScroll,
+         onHoverEvent = ::onHoverEvent,
+         onKeyboardPresses = ::onKeyboardPresses,
++        onKeyboardPressesFinished = ::onKeyboardPressesFinished,
+         isHigherPriorityGestureTrackingTouches = navigationEventInput::isBackGestureTrackingTouches,
+         onRemoveSubview = {
+             CoroutineScope(coroutineContext).launch {
+                 finishUnattachedKeysPresses()
++                resetHardwareKeyboardPresses()
+             }
+         }
+     )
+@@ -419,6 +421,7 @@ internal class ComposeSceneMediator(
+             focusedViewsList = focusedViewsList,
+             onInputStarted = { animateKeyboardOffsetChanges = true },
+             focusManager = { scene.focusManager },
++            onHardwareKeyRepeat = ::onHardwareKeyRepeat,
+             coroutineContext = coroutineContext,
+         ).also {
+             KeyboardVisibilityListener.initialize()
+@@ -700,6 +703,7 @@ internal class ComposeSceneMediator(
+     private fun dispose() {
+         onPreviewKeyEvent = { false }
+         onKeyEvent = { false }
++        resetHardwareKeyboardPresses()
+ 
+         _overlayView.dispose()
+         keyboardManager.dispose()
+@@ -781,13 +785,98 @@ internal class ComposeSceneMediator(
+      * Converts [UIPress] objects to [KeyEvent] and dispatches them to the appropriate handlers.
+      * @param presses a [Set] of [UIPress] objects. Erasure happens due to K/N not supporting Obj-C lightweight generics.
+      */
+-    private fun onKeyboardPresses(presses: Set<*>) {
+-        presses.forEach {
+-            val press = it as UIPress
+-            onKeyboardEvent(press.toComposeEvent())
++    private enum class HardwareKeyboardPressRoute(val forwardsToUIKit: Boolean) {
++        Native(forwardsToUIKit = true),
++        Application(forwardsToUIKit = false),
++        ApplicationWithNativeRepeat(forwardsToUIKit = true),
++    }
++
++    private data class RoutedHardwareKeyboardPress(
++        val press: UIPress,
++        val route: HardwareKeyboardPressRoute,
++    )
++
++    private val routedHardwareKeyboardPresses = mutableListOf<RoutedHardwareKeyboardPress>()
++
++    private fun onKeyboardPresses(presses: Set<*>): Set<*> =
++        presses.filterTo(mutableSetOf()) { value ->
++            val press = value as UIPress
++            val event = press.toComposeEvent()
++            when (event.type) {
++                KeyEventType.KeyDown -> routeHardwareKeyboardPressBegan(press, event).forwardsToUIKit
++                KeyEventType.KeyUp -> {
++                    onKeyboardEvent(event)
++                    routedHardwareKeyboardPresses
++                        .firstOrNull { it.press.isEqual(press) }
++                        ?.route
++                        ?.forwardsToUIKit
++                        ?: true
++                }
++                else -> {
++                    onKeyboardEvent(event)
++                    true
++                }
++            }
++        }
++
++    private fun routeHardwareKeyboardPressBegan(
++        press: UIPress,
++        event: KeyEvent,
++    ): HardwareKeyboardPressRoute {
++        routedHardwareKeyboardPresses.removeAll { it.press.isEqual(press) }
++
++        val dispatch = when {
++            textInputService.onPreviewKeyEvent(event) -> KeyboardEventDispatch.Native
++            textInputService.hasActiveComposition && event.isNativeCompositionInput() ->
++                KeyboardEventDispatch.Native
++            else -> dispatchApplicationKeyboardEvent(event)
++        }
++        updatePressedKeysState(event)
++
++        val route = when (dispatch) {
++            KeyboardEventDispatch.Native,
++            KeyboardEventDispatch.Unhandled -> HardwareKeyboardPressRoute.Native
++            KeyboardEventDispatch.Application -> {
++                if (textInputService.beginHardwareKeyboardRepeat(event)) {
++                    HardwareKeyboardPressRoute.ApplicationWithNativeRepeat
++                } else {
++                    HardwareKeyboardPressRoute.Application
++                }
++            }
++        }
++        routedHardwareKeyboardPresses += RoutedHardwareKeyboardPress(press, route)
++        return route
++    }
++
++    private fun onKeyboardPressesFinished(presses: Set<*>) {
++        presses.forEach { value ->
++            val press = value as UIPress
++            val event = press.toComposeEvent()
++            if (event.type == KeyEventType.KeyUp) {
++                finishHardwareKeyboardPress(press)
++            }
+         }
+     }
+ 
++    private fun finishHardwareKeyboardPress(press: UIPress) {
++        val routedPress = routedHardwareKeyboardPresses.firstOrNull { it.press.isEqual(press) }
++        if (routedPress?.route == HardwareKeyboardPressRoute.ApplicationWithNativeRepeat) {
++            textInputService.endHardwareKeyboardRepeat()
++        }
++        routedHardwareKeyboardPresses.removeAll { it.press.isEqual(press) }
++    }
++
++    private fun resetHardwareKeyboardPresses() {
++        if (
++            routedHardwareKeyboardPresses.any {
++                it.route == HardwareKeyboardPressRoute.ApplicationWithNativeRepeat
++            }
++        ) {
++            textInputService.resetHardwareKeyboardRepeat()
++        }
++        routedHardwareKeyboardPresses.clear()
++    }
++
+     private data class KeyIdentifier(
+         val key: Key,
+         val codePoint: Int,
+@@ -818,28 +907,57 @@ internal class ComposeSceneMediator(
+             return
+         }
+         pressedKeysState.filter { !it.isAttachedToWindow }.forEach { key ->
+-            onKeyboardEvent(
+-                KeyEvent(
+-                    key = key.key,
+-                    type = KeyEventType.KeyUp,
+-                    codePoint = key.codePoint,
+-                    isCtrlPressed = key.modifiers.isCtrlPressed,
+-                    isMetaPressed = key.modifiers.isMetaPressed,
+-                    isAltPressed = key.modifiers.isAltPressed,
+-                    isShiftPressed = key.modifiers.isShiftPressed,
+-                    nativeEvent = key.press,
+-                )
++            val event = KeyEvent(
++                key = key.key,
++                type = KeyEventType.KeyUp,
++                codePoint = key.codePoint,
++                isCtrlPressed = key.modifiers.isCtrlPressed,
++                isMetaPressed = key.modifiers.isMetaPressed,
++                isAltPressed = key.modifiers.isAltPressed,
++                isShiftPressed = key.modifiers.isShiftPressed,
++                nativeEvent = key.press,
+             )
++            onKeyboardEvent(event)
++            key.press?.let(::finishHardwareKeyboardPress)
+         }
+     }
+ 
++    private enum class KeyboardEventDispatch {
++        Native,
++        Application,
++        Unhandled,
++    }
++
+     private fun onKeyboardEvent(keyEvent: KeyEvent): Boolean {
+-        val result = textInputService.onPreviewKeyEvent(keyEvent)
+-            || onPreviewKeyEvent(keyEvent)
++        val dispatch = dispatchKeyboardEvent(keyEvent)
++        updatePressedKeysState(keyEvent)
++        return dispatch != KeyboardEventDispatch.Unhandled
++    }
++
++    private fun dispatchKeyboardEvent(keyEvent: KeyEvent): KeyboardEventDispatch {
++        if (textInputService.onPreviewKeyEvent(keyEvent)) {
++            return KeyboardEventDispatch.Native
++        }
++        return dispatchApplicationKeyboardEvent(keyEvent)
++    }
++
++    private fun dispatchApplicationKeyboardEvent(keyEvent: KeyEvent): KeyboardEventDispatch {
++        val handledByApplication = onPreviewKeyEvent(keyEvent)
+             || scene.sendKeyEvent(keyEvent)
+             || onKeyEvent(keyEvent)
+             || navigationEventInput.onKeyEvent(keyEvent)
++        return if (handledByApplication) {
++            KeyboardEventDispatch.Application
++        } else {
++            KeyboardEventDispatch.Unhandled
++        }
++    }
+ 
++    private fun onHardwareKeyRepeat(keyEvent: KeyEvent) {
++        dispatchApplicationKeyboardEvent(keyEvent)
++    }
++
++    private fun updatePressedKeysState(keyEvent: KeyEvent) {
+         val identifier = keyEvent.keyIdentifier()
+         if (keyEvent.type == KeyEventType.KeyDown) {
+             pressedKeysState.add(identifier)
+@@ -851,8 +969,6 @@ internal class ComposeSceneMediator(
+                 pressedKeysState.clear()
+             }
+         }
+-
+-        return result
+     }
+ 
+     private inner class PlatformContextImpl : PlatformContext {
+@@ -925,6 +1041,30 @@ private fun UIEvent.getButton(
+         null
+     }
+ 
++internal fun KeyEvent.isNativeCompositionInput(): Boolean {
++    val event = internal
++    if (
++        event.key == Key.DirectionLeft ||
++        event.key == Key.DirectionRight ||
++        event.key == Key.DirectionUp ||
++        event.key == Key.DirectionDown ||
++        event.key == Key.MoveHome ||
++        event.key == Key.MoveEnd ||
++        event.key == Key.PageUp ||
++        event.key == Key.PageDown ||
++        event.key == Key.Backspace ||
++        event.key == Key.Delete ||
++        event.key == Key.Enter ||
++        event.key == Key.Tab
++    ) {
++        return true
++    }
++    if (event.modifiers.isCtrlPressed || event.modifiers.isMetaPressed) {
++        return false
++    }
++    return event.codePoint != 0
++}
++
+ private val UIEvent?.timeMillis: Long get() {
+     // If the touches were cancelled due to gesture failure, the timestamp is not available,
+     // because no actual event with touch updates happened. We just use the current time in
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
+index 23683ee8340..e066d024f02 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
+@@ -17,6 +17,7 @@
+ package androidx.compose.ui.text.input
+ 
+ import androidx.compose.ui.geometry.Rect
++import androidx.compose.ui.input.key.KeyEvent
+ import androidx.compose.ui.platform.TextToolbarStatus
+ import androidx.compose.ui.platform.UIKitNativeTextInputContextMenuCustomAction
+ import androidx.compose.ui.platform.ViewConfiguration
+@@ -44,13 +45,15 @@ internal open class ComposeTextInputConnection(
+     coroutineScope: CoroutineScope,
+     viewConfiguration: ViewConfiguration,
+     focusedViewsList: FocusedViewsList?,
+-    focusManager: () -> ComposeSceneFocusManager?
++    focusManager: () -> ComposeSceneFocusManager?,
++    onHardwareKeyRepeat: (KeyEvent) -> Unit = {},
+ ) : TextInputConnection(
+     updateView,
+     view,
+     coroutineScope,
+     focusedViewsList,
+-    focusManager
++    focusManager,
++    onHardwareKeyRepeat,
+ ) {
+     // Fixes a problem where the menu is shown before the textInputView gets its final layout.
+     private var showMenuOrUpdatePosition = {}
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/HardwareKeyboardRepeatBridge.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/HardwareKeyboardRepeatBridge.ios.kt
+new file mode 100644
+index 00000000000..a2ef2a9db2d
+--- /dev/null
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/HardwareKeyboardRepeatBridge.ios.kt
+@@ -0,0 +1,107 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package androidx.compose.ui.text.input
++
++import androidx.compose.ui.input.key.Key
++import androidx.compose.ui.input.key.KeyEvent
++import androidx.compose.ui.input.key.KeyEventType
++import androidx.compose.ui.input.key.isAltPressed
++import androidx.compose.ui.input.key.isCtrlPressed
++import androidx.compose.ui.input.key.isMetaPressed
++import androidx.compose.ui.input.key.isShiftPressed
++import androidx.compose.ui.input.key.key
++import androidx.compose.ui.input.key.type
++
++internal class HardwareKeyboardRepeatBridge(
++    private val onRepeat: (KeyEvent) -> Unit,
++) {
++    private var activePress: ActiveHardwareKeyboardPress? = null
++    private var dispatchingRepeat = false
++
++    fun begin(event: KeyEvent, hasActiveComposition: Boolean): Boolean {
++        if (hasActiveComposition || event.type != KeyEventType.KeyDown || activePress != null) {
++            return false
++        }
++        val source = event.nativeRepeatSource() ?: return false
++        activePress = ActiveHardwareKeyboardPress(event, source)
++        return true
++    }
++
++    fun end(): Boolean {
++        if (activePress == null) return false
++        activePress = null
++        return true
++    }
++
++    fun reset() {
++        activePress = null
++        dispatchingRepeat = false
++    }
++
++    fun onSelectionChange(): Boolean {
++        val active = activePress ?: return false
++        if (dispatchingRepeat) return true
++        return when (active.source) {
++            NativeRepeatSource.SelectionChange -> active.consumeTick()
++            NativeRepeatSource.DeleteBackward -> true
++        }
++    }
++
++    fun onDeleteBackward(): Boolean {
++        val active = activePress ?: return false
++        if (dispatchingRepeat) return true
++        return when (active.source) {
++            NativeRepeatSource.SelectionChange -> false
++            NativeRepeatSource.DeleteBackward -> active.consumeTick()
++        }
++    }
++
++    private fun ActiveHardwareKeyboardPress.consumeTick(): Boolean {
++        if (!initialEchoConsumed) {
++            initialEchoConsumed = true
++            return true
++        }
++        dispatchingRepeat = true
++        try {
++            onRepeat(event)
++        } finally {
++            dispatchingRepeat = false
++        }
++        return true
++    }
++}
++
++private data class ActiveHardwareKeyboardPress(
++    val event: KeyEvent,
++    val source: NativeRepeatSource,
++    var initialEchoConsumed: Boolean = false,
++)
++
++private enum class NativeRepeatSource {
++    SelectionChange,
++    DeleteBackward,
++}
++
++private fun KeyEvent.nativeRepeatSource(): NativeRepeatSource? {
++    if (isCtrlPressed || isAltPressed || isMetaPressed) return null
++    return when (key) {
++        Key.DirectionUp,
++        Key.DirectionDown -> NativeRepeatSource.SelectionChange
++        Key.Delete -> NativeRepeatSource.DeleteBackward.takeUnless { isShiftPressed }
++        else -> null
++    }
++}
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/NativeTextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/NativeTextInputConnection.ios.kt
+index e20aa65615b..1a9e28a2cb0 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/NativeTextInputConnection.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/NativeTextInputConnection.ios.kt
+@@ -19,6 +19,7 @@ package androidx.compose.ui.text.input
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.geometry.Rect
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.input.key.KeyEvent
+ import androidx.compose.ui.platform.DpInsets
+ import androidx.compose.ui.platform.NativeTextEditingDelegate
+ import androidx.compose.ui.platform.PlatformTextLayoutDirection
+@@ -53,13 +54,15 @@ internal class NativeTextInputConnection(
+     view: UIView,
+     coroutineScope: CoroutineScope,
+     focusedViewsList: FocusedViewsList?,
+-    focusManager: () -> ComposeSceneFocusManager?
++    focusManager: () -> ComposeSceneFocusManager?,
++    onHardwareKeyRepeat: (KeyEvent) -> Unit = {},
+ ) : TextInputConnection(
+     updateView,
+     view,
+     coroutineScope,
+     focusedViewsList,
+-    focusManager
++    focusManager,
++    onHardwareKeyRepeat,
+ ), NativeTextEditingDelegate {
+     private val scrollView by lazy { NativeTextInputScrollView() }
+ 
+@@ -394,4 +397,4 @@ internal class NativeTextInputConnection(
+      * Must be at least 1.dp to make caret interactable
+      */
+     private val cursorThickness = 2.dp
+-}
+\ No newline at end of file
++}
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+index c0a928c0d00..a44bab25bf6 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+@@ -55,6 +55,7 @@ internal abstract class TextInputConnection(
+     protected val coroutineScope: CoroutineScope,
+     protected val focusedViewsList: FocusedViewsList?,
+     private var focusManager: () -> ComposeSceneFocusManager?,
++    onHardwareKeyRepeat: (KeyEvent) -> Unit = {},
+ ): TextEditingDelegate {
+ 
+     private var textInputServiceInvalidationsCount = 0
+@@ -72,6 +73,7 @@ internal abstract class TextInputConnection(
+     private var currentRequest: PlatformTextInputMethodRequest? = null
+     private val pendingEditCommands = mutableListOf<EditCommand>()
+     private var editFlushJob: Job? = null
++    private val hardwareKeyboardRepeatBridge = HardwareKeyboardRepeatBridge(onHardwareKeyRepeat)
+ 
+     protected abstract val textInputView: UIView
+     protected var currentTextFieldValue: TextFieldValue? = null
+@@ -93,6 +95,7 @@ internal abstract class TextInputConnection(
+     protected abstract fun attachInputToView()
+ 
+     open fun stop() {
++        hardwareKeyboardRepeatBridge.reset()
+         clearPendingEdits()
+         currentRequest = null
+         currentTextFieldValue = null
+@@ -152,6 +155,18 @@ internal abstract class TextInputConnection(
+         }
+     }
+ 
++    val hasActiveComposition: Boolean
++        get() = currentTextFieldValue?.composition != null
++
++    fun beginHardwareKeyboardRepeat(event: KeyEvent): Boolean =
++        hardwareKeyboardRepeatBridge.begin(event, hasActiveComposition)
++
++    fun endHardwareKeyboardRepeat(): Boolean = hardwareKeyboardRepeatBridge.end()
++
++    fun resetHardwareKeyboardRepeat() {
++        hardwareKeyboardRepeatBridge.reset()
++    }
++
+     abstract fun setAvailableEditMenuActions(
+         copy: (() -> Unit)?,
+         paste: (() -> Unit)?,
+@@ -372,6 +387,7 @@ internal abstract class TextInputConnection(
+     }
+ 
+     override fun deleteBackward() {
++        if (hardwareKeyboardRepeatBridge.onDeleteBackward()) return
+         if (currentTextFieldValue?.selection?.collapsed == true) {
+             edit {
+                 deleteSurroundingTextInCodePoints(1, 0)
+@@ -388,6 +404,7 @@ internal abstract class TextInputConnection(
+     override fun getSelectedTextRange(): TextRange? = currentTextFieldValue?.selection
+ 
+     override fun setSelectedTextRange(range: TextRange?) {
++        if (hardwareKeyboardRepeatBridge.onSelectionChange()) return
+         edit(requireUpdateView = false) {
+             if (range != null) {
+                 setSelection(range.start, range.end)
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/InputViews.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/InputViews.ios.kt
+index 3f9db086d27..52df9f5a971 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/InputViews.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/InputViews.ios.kt
+@@ -555,7 +555,8 @@ internal class OverlayInputView(
+     onScrollEvent: (position: DpOffset, delta: DpOffset, event: UIEvent?, eventKind: TouchesEventKind) -> Unit,
+     onCancelScroll: () -> Unit,
+     private var onHoverEvent: (position: DpOffset, event: UIEvent?, eventKind: TouchesEventKind) -> Unit,
+-    private var onKeyboardPresses: (Set<*>) -> Unit,
++    private var onKeyboardPresses: (Set<*>) -> Set<*>,
++    private var onKeyboardPressesFinished: (Set<*>) -> Unit,
+     isHigherPriorityGestureTrackingTouches: () -> Boolean,
+     private var onRemoveSubview: () -> Unit,
+ ) : CMPScrollView(CGRectZero.readValue()) {
+@@ -634,18 +635,27 @@ internal class OverlayInputView(
+     override fun canBecomeFocused(): Boolean = false
+ 
+     override fun pressesBegan(presses: Set<*>, withEvent: UIPressesEvent?) {
+-        onKeyboardPresses(presses)
+-        super.pressesBegan(presses, withEvent)
++        val nativePresses = onKeyboardPresses(presses)
++        if (nativePresses.isNotEmpty()) {
++            super.pressesBegan(nativePresses, withEvent)
++        }
++        onKeyboardPressesFinished(presses)
+     }
+ 
+     override fun pressesEnded(presses: Set<*>, withEvent: UIPressesEvent?) {
+-        onKeyboardPresses(presses)
+-        super.pressesEnded(presses, withEvent)
++        val nativePresses = onKeyboardPresses(presses)
++        if (nativePresses.isNotEmpty()) {
++            super.pressesEnded(nativePresses, withEvent)
++        }
++        onKeyboardPressesFinished(presses)
+     }
+ 
+     override fun pressesCancelled(presses: Set<*>, withEvent: UIPressesEvent?) {
+-        onKeyboardPresses(presses)
+-        super.pressesCancelled(presses, withEvent)
++        val nativePresses = onKeyboardPresses(presses)
++        if (nativePresses.isNotEmpty()) {
++            super.pressesCancelled(nativePresses, withEvent)
++        }
++        onKeyboardPressesFinished(presses)
+     }
+ 
+     private val trackedTouchesOutside: MutableSet<UITouch> = mutableSetOf()
+@@ -770,7 +780,8 @@ internal class OverlayInputView(
+         hitTestInteropView = { null }
+         isPointInsideInteractionBounds = { false }
+         canIgnoreDragGesture = { false }
+-        onKeyboardPresses = {}
++        onKeyboardPresses = { emptySet<Any>() }
++        onKeyboardPressesFinished = {}
+         onOutsidePointerEvent = {}
+         onTouchesEvent = { _, _, _ -> PointerEventResult() }
+         onCancelAllTouches = {}
+diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/scene/HardwareKeyboardRoutingPolicyTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/scene/HardwareKeyboardRoutingPolicyTest.kt
+new file mode 100644
+index 00000000000..5805ae84bdf
+--- /dev/null
++++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/scene/HardwareKeyboardRoutingPolicyTest.kt
+@@ -0,0 +1,56 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package androidx.compose.ui.scene
++
++import androidx.compose.ui.input.key.Key
++import androidx.compose.ui.input.key.KeyEvent
++import androidx.compose.ui.input.key.KeyEventType
++import kotlin.test.Test
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++class HardwareKeyboardRoutingPolicyTest {
++    @Test
++    fun textAndEditingKeysStayNativeDuringComposition() {
++        assertTrue(keyDown(Key.A, codePoint = 'a'.code).isNativeCompositionInput())
++        assertTrue(keyDown(Key.DirectionUp, isMetaPressed = true).isNativeCompositionInput())
++        assertTrue(keyDown(Key.Delete).isNativeCompositionInput())
++    }
++
++    @Test
++    fun modifiedApplicationShortcutsRemainDispatchableDuringComposition() {
++        assertFalse(
++            keyDown(Key.B, codePoint = 'b'.code, isMetaPressed = true)
++                .isNativeCompositionInput()
++        )
++        assertFalse(keyDown(Key.F12, isCtrlPressed = true).isNativeCompositionInput())
++    }
++}
++
++private fun keyDown(
++    key: Key,
++    codePoint: Int = 0,
++    isCtrlPressed: Boolean = false,
++    isMetaPressed: Boolean = false,
++): KeyEvent =
++    KeyEvent(
++        key = key,
++        type = KeyEventType.KeyDown,
++        codePoint = codePoint,
++        isCtrlPressed = isCtrlPressed,
++        isMetaPressed = isMetaPressed,
++    )
+diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/HardwareKeyboardRepeatBridgeTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/HardwareKeyboardRepeatBridgeTest.kt
+new file mode 100644
+index 00000000000..e814cd7db85
+--- /dev/null
++++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/HardwareKeyboardRepeatBridgeTest.kt
+@@ -0,0 +1,142 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package androidx.compose.ui.text.input
++
++import androidx.compose.ui.input.key.Key
++import androidx.compose.ui.input.key.KeyEvent
++import androidx.compose.ui.input.key.KeyEventType
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++class HardwareKeyboardRepeatBridgeTest {
++    @Test
++    fun verticalNavigationConsumesInitialNativeEchoThenRepeatsFromLaterTicks() {
++        val repeats = mutableListOf<KeyEvent>()
++        val bridge = HardwareKeyboardRepeatBridge(repeats::add)
++        val event = keyDown(Key.DirectionDown)
++
++        assertTrue(bridge.begin(event, hasActiveComposition = false))
++        assertTrue(bridge.onSelectionChange())
++        assertEquals(emptyList(), repeats)
++
++        assertTrue(bridge.onSelectionChange())
++        assertEquals(listOf(event), repeats)
++    }
++
++    @Test
++    fun forwardDeleteConsumesSelectionPreludeAndUsesDeleteBackwardAsTick() {
++        val repeats = mutableListOf<KeyEvent>()
++        val bridge = HardwareKeyboardRepeatBridge(repeats::add)
++        val event = keyDown(Key.Delete)
++
++        assertTrue(bridge.begin(event, hasActiveComposition = false))
++        assertTrue(bridge.onSelectionChange())
++        assertTrue(bridge.onDeleteBackward())
++        assertEquals(emptyList(), repeats)
++
++        assertTrue(bridge.onSelectionChange())
++        assertTrue(bridge.onDeleteBackward())
++        assertEquals(listOf(event), repeats)
++    }
++
++    @Test
++    fun visibleCompositionAndNativeOwnedKeysDoNotArmTheBridge() {
++        val bridge = HardwareKeyboardRepeatBridge {}
++
++        assertFalse(bridge.begin(keyDown(Key.DirectionUp), hasActiveComposition = true))
++        assertFalse(bridge.begin(keyDown(Key.DirectionLeft), hasActiveComposition = false))
++        assertFalse(bridge.begin(keyDown(Key.Backspace), hasActiveComposition = false))
++        assertFalse(bridge.onSelectionChange())
++        assertFalse(bridge.onDeleteBackward())
++    }
++
++    @Test
++    fun shiftVerticalNavigationIsEligibleButOtherModifiersAreNot() {
++        val bridge = HardwareKeyboardRepeatBridge {}
++
++        assertTrue(
++            bridge.begin(
++                keyDown(Key.DirectionUp, isShiftPressed = true),
++                hasActiveComposition = false,
++            )
++        )
++        bridge.reset()
++        assertFalse(
++            bridge.begin(
++                keyDown(Key.DirectionUp, isAltPressed = true),
++                hasActiveComposition = false,
++            )
++        )
++    }
++
++    @Test
++    fun secondEditingPressCannotStealAnonymousNativeTicks() {
++        val repeats = mutableListOf<KeyEvent>()
++        val bridge = HardwareKeyboardRepeatBridge(repeats::add)
++        val down = keyDown(Key.DirectionDown)
++
++        assertTrue(bridge.begin(down, hasActiveComposition = false))
++        assertFalse(bridge.begin(keyDown(Key.DirectionUp), hasActiveComposition = false))
++        assertTrue(bridge.onSelectionChange())
++        assertTrue(bridge.onSelectionChange())
++        assertEquals(listOf(down), repeats)
++    }
++
++    @Test
++    fun keyUpAndResetClearTheActiveRepeatSource() {
++        val bridge = HardwareKeyboardRepeatBridge {}
++        val event = keyDown(Key.DirectionDown)
++
++        assertTrue(bridge.begin(event, hasActiveComposition = false))
++        bridge.end()
++        assertFalse(bridge.onSelectionChange())
++
++        assertTrue(bridge.begin(event, hasActiveComposition = false))
++        bridge.reset()
++        assertFalse(bridge.onSelectionChange())
++    }
++
++    @Test
++    fun repeatDispatchSelectionUpdatesAreConsumedWithoutRecursing() {
++        lateinit var bridge: HardwareKeyboardRepeatBridge
++        var repeatCount = 0
++        bridge =
++            HardwareKeyboardRepeatBridge {
++                repeatCount += 1
++                assertTrue(bridge.onSelectionChange())
++            }
++
++        assertTrue(bridge.begin(keyDown(Key.DirectionDown), hasActiveComposition = false))
++        assertTrue(bridge.onSelectionChange())
++        assertTrue(bridge.onSelectionChange())
++        assertEquals(1, repeatCount)
++    }
++}
++
++private fun keyDown(
++    key: Key,
++    isShiftPressed: Boolean = false,
++    isAltPressed: Boolean = false,
++): KeyEvent =
++    KeyEvent(
++        key = key,
++        type = KeyEventType.KeyDown,
++        isShiftPressed = isShiftPressed,
++        isAltPressed = isAltPressed,
++    )
