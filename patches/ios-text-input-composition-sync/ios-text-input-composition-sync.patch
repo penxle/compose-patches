@@ -1,0 +1,414 @@
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/TextInputHelpers.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/TextInputHelpers.ios.kt
+index 5b96986bf83fb4e4bb8e0835346192f3036b5429..d64f79a0ed067756c81c79d52c5b81f2994ab8c8 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/TextInputHelpers.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/TextInputHelpers.ios.kt
+@@ -49,6 +49,9 @@ import platform.UIKit.UITextWritingDirection
+ internal interface TextEditingDelegate {
+     var inputTraits: SkikoUITextInputTraits
+
++    /** Applies queued native edits before a synchronous native editing action continues. */
++    fun flushPendingTextInputEdits()
++
+     fun onResignFocus()
+
+     fun beginFloatingCursor(offset: DpOffset)
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+index a44bab25bf6db632f5a5bc215515a8d3779a8e86..1e2abfbcc375c7dc6962cd6e8f2cbdf7024f3e1f 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+@@ -213,7 +213,8 @@ internal abstract class TextInputConnection(
+
+     private fun handleEscape(event: KeyEvent): Boolean {
+         return if (currentRequest != null) {
+-            if (event.type == KeyEventType.KeyDown) {
++            // UIKit must handle cancellation before Escape can release the editor's focus.
++            if (event.type == KeyEventType.KeyDown && currentTextFieldValue?.composition == null) {
+                 focusManager()?.releaseFocus()
+             }
+             true
+@@ -244,8 +245,13 @@ internal abstract class TextInputConnection(
+         if (commands.isEmpty()) return
+
+         pendingEditCommands += commands
+-        currentTextFieldValue =
+-            EditProcessor().also { it.reset(currentValue, null) }.apply(commands)
++        val processor = EditProcessor().also { it.reset(currentValue, null) }
++        // reset treats the initial text as an external replacement and commits its composition.
++        // Restore UIKit's marked range before predicting the next native editing operation.
++        currentValue.composition?.let {
++            processor.apply(listOf(SetComposingRegionCommand(it.min, it.max)))
++        }
++        currentTextFieldValue = processor.apply(commands)
+         if (requireUpdateView) {
+             updateView()
+         }
+@@ -257,6 +263,11 @@ internal abstract class TextInputConnection(
+         }
+     }
+
++    override fun flushPendingTextInputEdits() {
++        editFlushJob?.cancel()
++        flushPendingEdits()
++    }
++
+     private fun flushPendingEdits() {
+         editFlushJob = null
+         val request = currentRequest ?: return clearPendingEdits()
+@@ -274,6 +285,10 @@ internal abstract class TextInputConnection(
+             postponeSelectionUpdate = false
+         }
+
++        // Applying the host edit can replace the session or reenter native editing.
++        // In either case, its newer prediction must not be replaced by this batch.
++        if (currentRequest !== request || pendingEditCommands.isNotEmpty()) return
++
+         val actualValue = request.stateSnapshot()
+         if (actualValue == expectedValue) {
+             currentTextFieldValue = actualValue
+@@ -438,8 +453,12 @@ internal abstract class TextInputConnection(
+
+     override fun setMarkedText(markedText: String?, selectedRange: TextRange) {
+         if (markedText != null) {
++            val value = currentTextFieldValue ?: return
++            val start = value.composition?.min ?: value.selection.min
+             edit(requireUpdateView = false) {
+                 setComposingText(markedText, 1)
++                // UIKit's selection is relative to the new marked text, in UTF-16 offsets.
++                setSelection(start + selectedRange.start, start + selectedRange.end)
+             }
+         }
+     }
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt
+index 1f99b5398141aa453265e3fb34b5919498dc3bc6..64375e16be9d27b4d4e6c2fcc4fb879d81a8f9f2 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt
+@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.dp
+ import kotlin.time.Duration.Companion.milliseconds
+ import kotlin.time.DurationUnit
+ import kotlinx.cinterop.CValue
++import kotlinx.cinterop.ObjCAction
+ import kotlinx.cinterop.readValue
+ import kotlinx.cinterop.useContents
+ import platform.CoreGraphics.CGPoint
+@@ -90,6 +91,13 @@ internal class ComposeTextInputView(
+     private val inputTraits: SkikoUITextInputTraits
+         get() = input?.inputTraits ?: EmptyInputTraits
+
++    // Native editing integrations can establish an explicit boundary without waiting
++    // for the next run-loop turn or changing the batching of ordinary IME callbacks.
++    @ObjCAction
++    fun flushPendingTextInputEdits() {
++        input?.flushPendingTextInputEdits()
++    }
++
+     override fun inputView(): UIView? = inputTraits.inputView()
+     override fun inputAccessoryView(): UIView? = inputTraits.inputAccessoryView()
+
+diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
+index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..a1c010887edd6a14584d01644d1b92f0bf812b8a 100644
+--- a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
++++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
+@@ -16,13 +16,28 @@
+
+ package androidx.compose.ui.text.input
+
++import androidx.compose.ui.InternalComposeUiApi
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.focusTarget
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.geometry.Rect
++import androidx.compose.ui.input.key.Key
++import androidx.compose.ui.input.key.KeyEvent
++import androidx.compose.ui.input.key.KeyEventType
++import androidx.compose.ui.layout.Layout
++import androidx.compose.ui.platform.FrameRecomposer
+ import androidx.compose.ui.platform.PlatformTextInputMethodRequest
++import androidx.compose.ui.scene.CanvasLayersComposeScene
++import androidx.compose.ui.scene.ComposeSceneFocusManager
+ import androidx.compose.ui.text.TextLayoutResult
+ import androidx.compose.ui.text.TextRange
++import androidx.compose.ui.window.ComposeTextInputView
+ import kotlin.test.Test
+ import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
+ import kotlinx.cinterop.ExperimentalForeignApi
+ import kotlinx.cinterop.readValue
+ import kotlinx.coroutines.CoroutineScope
+@@ -32,8 +47,239 @@ import kotlinx.coroutines.test.runTest
+ import platform.CoreGraphics.CGRectZero
+ import platform.UIKit.UIView
+
+-@OptIn(ExperimentalForeignApi::class, ExperimentalCoroutinesApi::class)
++@OptIn(ExperimentalForeignApi::class, ExperimentalCoroutinesApi::class, InternalComposeUiApi::class)
+ class TextInputConnectionIosTest {
++    @Test
++    fun nativeActionFlushAppliesSelectionBeforeTheNextEditAndDoesNotReplayIt() = runTest {
++        val request = TestRequest(TextFieldValue("ab", TextRange(2)))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        val inputView = ComposeTextInputView(300).also { it.input = connection }
++        connection.start(request)
++
++        connection.setSelectedTextRange(TextRange(1))
++        inputView.flushPendingTextInputEdits()
++
++        assertEquals(TextFieldValue("ab", TextRange(1)), request.value())
++        assertEquals(listOf(listOf<EditCommand>(SetSelectionCommand(1, 1))), request.dispatchedCommands)
++
++        connection.insertText("X")
++        runCurrent()
++
++        assertEquals(TextFieldValue("aXb", TextRange(2)), request.value())
++        assertEquals(
++            listOf(listOf<EditCommand>(SetSelectionCommand(1, 1)), listOf<EditCommand>(CommitTextCommand("X", 1))),
++            request.dispatchedCommands,
++        )
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun sessionReplacedDuringNativeFlushDoesNotRestoreThePreviousValue() = runTest {
++        val request = TestRequest(TextFieldValue("old", TextRange(3)))
++        val nextRequest = TestRequest(TextFieldValue("new", TextRange(0)))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++        request.afterEdit = { connection.start(nextRequest) }
++
++        connection.setSelectedTextRange(TextRange(2))
++        connection.flushPendingTextInputEdits()
++        assertEquals(TextRange(0), connection.getSelectedTextRange())
++        assertEquals("new", connection.textInRange(TextRange(0, connection.endOfDocument())))
++
++        connection.insertText("X")
++        runCurrent()
++
++        assertEquals(TextFieldValue("old", TextRange(2)), request.value())
++        assertEquals(TextFieldValue("Xnew", TextRange(1)), nextRequest.value())
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun reentrantNativeEditDuringFlushRetainsItsPredictionForTheFollowingCallback() = runTest {
++        val request = TestRequest(TextFieldValue("ab", TextRange(2)))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++        request.afterEdit = {
++            request.afterEdit = {}
++            connection.insertText("X")
++        }
++
++        connection.setSelectedTextRange(TextRange(1))
++        connection.flushPendingTextInputEdits()
++        assertEquals("aXb", connection.textInRange(TextRange(0, connection.endOfDocument())))
++        assertEquals(TextRange(2), connection.getSelectedTextRange())
++
++        connection.insertText("Y")
++        runCurrent()
++
++        assertEquals(TextFieldValue("aXYb", TextRange(3)), request.value())
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun markedTextSelectionIsRelativeToTheReplacedSelectionInUtf16() = runTest {
++        val request = TestRequest(TextFieldValue("😀abZ", TextRange(3, 4)))
++        request.resultOverride = TextFieldValue("😀aに😀ほZ", TextRange(4, 6), TextRange(3, 7))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        connection.setMarkedText("に😀ほ", TextRange(1, 3))
++
++        assertEquals("😀aに😀ほZ", connection.textInRange(TextRange(0, connection.endOfDocument())))
++        assertEquals(TextRange(3, 7), connection.markedTextRange())
++        assertEquals(TextRange(4, 6), connection.getSelectedTextRange())
++
++        runCurrent()
++
++        assertEquals(
++            listOf(listOf(SetComposingTextCommand("に😀ほ", 1), SetSelectionCommand(4, 6))),
++            request.dispatchedCommands,
++        )
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun markedTextCaretUsesCompositionStartAfterMovingInsideComposition() = runTest {
++        val request = TestRequest(TextFieldValue("aにほんZ", TextRange(4), TextRange(1, 4)))
++        request.resultOverride = TextFieldValue("a日本語Z", TextRange(2), TextRange(1, 4))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        connection.setMarkedText("にほん", TextRange(2))
++        assertEquals(TextRange(3), connection.getSelectedTextRange())
++        assertEquals(TextRange(1, 4), connection.markedTextRange())
++
++        connection.setMarkedText("日本語", TextRange(1))
++        assertEquals("a日本語Z", connection.textInRange(TextRange(0, connection.endOfDocument())))
++        assertEquals(TextRange(2), connection.getSelectedTextRange())
++        assertEquals(TextRange(1, 4), connection.markedTextRange())
++
++        runCurrent()
++
++        assertEquals(emptyList(), connection.stateWillChanges)
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun emptyMarkedTextRemovesTheCompositionWithoutMovingIntoSurroundingText() = runTest {
++        val request = TestRequest(TextFieldValue("aにほんZ", TextRange(2), TextRange(1, 4)))
++        request.resultOverride = TextFieldValue("aZ", TextRange(1))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        connection.setMarkedText("", TextRange.Zero)
++
++        assertEquals("aZ", connection.textInRange(TextRange(0, connection.endOfDocument())))
++        assertEquals(TextRange(1), connection.getSelectedTextRange())
++        assertEquals(null, connection.markedTextRange())
++
++        runCurrent()
++
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun escapeKeepsFocusUntilANewPressAfterCompositionEnds() = runTest {
++        val frameRecomposer = FrameRecomposer(coroutineContext)
++        val scene = CanvasLayersComposeScene(frameRecomposer = frameRecomposer)
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext)) { scene.focusManager }
++        try {
++            val focusRequester = FocusRequester()
++            scene.setContent {
++                Layout(content = {}, modifier = Modifier.focusRequester(focusRequester).focusTarget()) { _, _ ->
++                    layout(10, 10) {}
++                }
++            }
++            scene.measureAndLayout()
++            assertTrue(focusRequester.requestFocus())
++            assertTrue(scene.focusManager.hasFocus)
++
++            val down = KeyEvent(key = Key.Escape, type = KeyEventType.KeyDown)
++            val up = KeyEvent(key = Key.Escape, type = KeyEventType.KeyUp)
++            assertFalse(connection.onPreviewKeyEvent(down))
++            assertTrue(scene.focusManager.hasFocus)
++
++            connection.start(TestRequest(TextFieldValue("にほん", TextRange(3), TextRange(0, 3))))
++            assertTrue(connection.onPreviewKeyEvent(down))
++            assertTrue(scene.focusManager.hasFocus)
++
++            // UIKit handles the press and ends composition before releasing the key.
++            connection.unmarkText()
++            runCurrent()
++            assertEquals(null, connection.markedTextRange())
++            assertTrue(connection.onPreviewKeyEvent(up))
++            assertTrue(scene.focusManager.hasFocus)
++
++            assertTrue(connection.onPreviewKeyEvent(down))
++            assertFalse(scene.focusManager.hasFocus)
++        } finally {
++            connection.stop()
++            scene.close()
++            frameRecomposer.close()
++        }
++    }
++
++    @Test
++    fun markedTextCallbacksInTheSameTurnReplaceThePredictedComposition() = runTest {
++        val request = TestRequest(TextFieldValue("ab", TextRange(1)))
++        request.resultOverride = TextFieldValue("aにほb", TextRange(3), TextRange(1, 3))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        for (markedText in listOf("n", "に", "にh", "にほ")) {
++            connection.setMarkedText(markedText, TextRange(markedText.length))
++            assertEquals("a${markedText}b", connection.textInRange(TextRange(0, connection.endOfDocument())))
++            assertEquals(TextRange(1, 1 + markedText.length), connection.markedTextRange())
++            assertEquals(TextRange(1 + markedText.length), connection.getSelectedTextRange())
++        }
++
++        runCurrent()
++
++        assertEquals("aにほb", connection.textInRange(TextRange(0, connection.endOfDocument())))
++        assertEquals(emptyList(), connection.stateWillChanges)
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun markedTextContinuesAcrossFlushesWithoutExternalChangeNotifications() = runTest {
++        val request = TestRequest(TextFieldValue("ab", TextRange(1)))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        for (markedText in listOf("n", "に", "にh", "にほ", "にほん", "日本語")) {
++            // The host replaces its entire marked range, independently of the predictor.
++            request.resultOverride = TextFieldValue(
++                "a${markedText}b", TextRange(1 + markedText.length), TextRange(1, 1 + markedText.length)
++            )
++            connection.setMarkedText(markedText, TextRange(markedText.length))
++            runCurrent()
++
++            assertEquals("a${markedText}b", connection.textInRange(TextRange(0, connection.endOfDocument())))
++            assertEquals(TextRange(1, 1 + markedText.length), connection.markedTextRange())
++            assertEquals(emptyList(), connection.stateWillChanges)
++            assertEquals(emptyList(), connection.stateDidChanges)
++        }
++    }
++
++    @Test
++    fun nativeCommitReplacesAnExistingCompositionInThePrediction() = runTest {
++        val request = TestRequest(TextFieldValue("aにhZ", TextRange(3), TextRange(1, 3)))
++        request.resultOverride = TextFieldValue("a日本語Z", TextRange(4))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++
++        connection.insertText("日本語")
++
++        assertEquals("a日本語Z", connection.textInRange(TextRange(0, connection.endOfDocument())))
++        assertEquals(TextRange(4), connection.getSelectedTextRange())
++        assertEquals(null, connection.markedTextRange())
++
++        runCurrent()
++
++        assertEquals(emptyList(), connection.stateWillChanges)
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
+     @Test
+     fun nativeEditsInTheSameTurnAreDispatchedAsOneEdit() = runTest {
+         val request = TestRequest(TextFieldValue("ab", TextRange(2)))
+@@ -140,15 +386,16 @@ class TextInputConnectionIosTest {
+     }
+ }
+
+-@OptIn(ExperimentalForeignApi::class)
++@OptIn(ExperimentalForeignApi::class, InternalComposeUiApi::class)
+ private class TestTextInputConnection(
+     scope: CoroutineScope,
++    focusManager: () -> ComposeSceneFocusManager? = { null },
+ ) : TextInputConnection(
+     updateView = {},
+     view = UIView(frame = CGRectZero.readValue()),
+     coroutineScope = scope,
+     focusedViewsList = null,
+-    focusManager = { null },
++    focusManager = focusManager,
+ ) {
+     val stateWillChanges = mutableListOf<Pair<Boolean, Boolean>>()
+     val stateDidChanges = mutableListOf<Pair<Boolean, Boolean>>()
+@@ -188,6 +435,7 @@ private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMetho
+
+     val dispatchedCommands = mutableListOf<List<EditCommand>>()
+     var resultOverride: TextFieldValue? = null
++    var afterEdit: () -> Unit = {}
+
+     override val value: () -> TextFieldValue = { fieldValue }
+
+@@ -234,5 +482,6 @@ private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMetho
+         fieldValue =
+             resultOverride
+                 ?: EditProcessor().also { it.reset(fieldValue, null) }.apply(commands)
++        afterEdit()
+     }
+ }

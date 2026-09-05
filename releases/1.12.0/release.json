@@ -8,7 +8,8 @@
     "ios-text-input-edit-batching",
     "ios-compose-text-input-initial-frame",
     "ios-zero-duration-keyboard-frame",
-    "ios-hardware-keyboard-native-repeat"
+    "ios-hardware-keyboard-native-repeat",
+    "ios-text-input-composition-sync"
   ],
   "publications": [
     {

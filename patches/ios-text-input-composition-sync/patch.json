@@ -1,0 +1,15 @@
+{
+  "upstream_repository": "JetBrains/compose-multiplatform-core",
+  "upstream_commit": "f29d2f99f3beafc60992c6a73dbbaa9f841c5d4c",
+  "version": "1.12.0",
+  "files": [
+    "ios-text-input-composition-sync.patch"
+  ],
+  "verify_commands": [
+    [
+      ":compose:ui:ui:iosSimulatorArm64Test",
+      "--tests",
+      "androidx.compose.ui.text.input.TextInputConnectionIosTest"
+    ]
+  ]
+}
