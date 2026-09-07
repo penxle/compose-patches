@@ -5,19 +5,137 @@ index 5b96986bf83fb4e4bb8e0835346192f3036b5429..d64f79a0ed067756c81c79d52c5b81f2
 @@ -49,6 +49,9 @@ import platform.UIKit.UITextWritingDirection
  internal interface TextEditingDelegate {
      var inputTraits: SkikoUITextInputTraits
-
+ 
 +    /** Applies queued native edits before a synchronous native editing action continues. */
 +    fun flushPendingTextInputEdits()
 +
      fun onResignFocus()
-
+ 
      fun beginFloatingCursor(offset: DpOffset)
 diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
-index a44bab25bf6db632f5a5bc215515a8d3779a8e86..1e2abfbcc375c7dc6962cd6e8f2cbdf7024f3e1f 100644
+index c0a928c0d00b14a04f39c62f5da9da1baef2f919..8bec8d6e3b9c93ac722dfcb83607317c7137225c 100644
 --- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
 +++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
-@@ -213,7 +213,8 @@ internal abstract class TextInputConnection(
-
+@@ -55,31 +55,37 @@ internal abstract class TextInputConnection(
+     protected val coroutineScope: CoroutineScope,
+     protected val focusedViewsList: FocusedViewsList?,
+     private var focusManager: () -> ComposeSceneFocusManager?,
+-): TextEditingDelegate {
++) : TextEditingDelegate {
+ 
+     private var textInputServiceInvalidationsCount = 0
+     val hasInvalidations: Boolean
+         get() = textInputServiceInvalidationsCount > 0
+ 
+     /**
+-     * When `true`, [onTextFieldValueUpdated] callbacks coming back through the state snapshot flow
+-     * during an [edit] cycle are absorbed without notifying UITextInputDelegate. This avoids
+-     * resetting multi-stage IME state when UIKit itself initiated the change.
++     * Identifies the native batch whose snapshot echoes can be absorbed without notifying
++     * UITextInputDelegate. A newer edit invalidates an outer batch's suppression, so host changes
++     * after a completed nested flush still notify UIKit.
+      */
+-    private var postponeSelectionUpdate: Boolean = false
++    private var applyingEditGeneration: Long? = null
+ 
+-    private var floatingCursorTranslation : Offset? = null
++    private var floatingCursorTranslation: Offset? = null
+     private var currentRequest: PlatformTextInputMethodRequest? = null
+     private val pendingEditCommands = mutableListOf<EditCommand>()
++    private var editGeneration = 0L
+     private var editFlushJob: Job? = null
+ 
+     protected abstract val textInputView: UIView
+     protected var currentTextFieldValue: TextFieldValue? = null
+         protected set
+ 
+-    protected val textLayoutResult get() = currentRequest?.textLayoutResult()
+-    protected val unclippedTextOffsetInRoot get() = currentRequest?.unclippedTextOffsetInRoot()
+-    protected val textFieldRectInRoot get() = currentRequest?.textFieldRectInRoot()
++    protected val textLayoutResult
++        get() = currentRequest?.textLayoutResult()
++
++    protected val unclippedTextOffsetInRoot
++        get() = currentRequest?.unclippedTextOffsetInRoot()
++
++    protected val textFieldRectInRoot
++        get() = currentRequest?.textFieldRectInRoot()
+ 
+     fun start(request: PlatformTextInputMethodRequest) {
+         clearPendingEdits()
+@@ -120,18 +126,15 @@ internal abstract class TextInputConnection(
+         if (pendingEditCommands.isNotEmpty()) {
+             return
+         }
+-        if (postponeSelectionUpdate) {
++        if (applyingEditGeneration == editGeneration) {
+             currentTextFieldValue = newValue
+             return
+         }
+         val internalOldValue = currentTextFieldValue
+         val compositionChanged = internalOldValue?.composition != newValue.composition
+         val textChanged =
+-            internalOldValue == null ||
+-                internalOldValue.text != newValue.text ||
+-                compositionChanged
+-        val selectionChanged =
+-            textChanged || internalOldValue.selection != newValue.selection
++            internalOldValue == null || internalOldValue.text != newValue.text || compositionChanged
++        val selectionChanged = textChanged || internalOldValue.selection != newValue.selection
+ 
+         stateWillChange(textChanged, selectionChanged)
+         currentTextFieldValue = newValue
+@@ -139,6 +142,7 @@ internal abstract class TextInputConnection(
+     }
+ 
+     protected abstract fun stateWillChange(textChanged: Boolean, selectionChanged: Boolean)
++
+     protected abstract fun stateDidChange(textChanged: Boolean, selectionChanged: Boolean)
+ 
+     abstract fun onViewGeometryUpdated()
+@@ -157,22 +161,23 @@ internal abstract class TextInputConnection(
+         paste: (() -> Unit)?,
+         cut: (() -> Unit)?,
+         selectAll: (() -> Unit)?,
+-        customActions: List<UIKitNativeTextInputContextMenuCustomAction>?
++        customActions: List<UIKitNativeTextInputContextMenuCustomAction>?,
+     )
+ 
+     /**
+      * Workaround to prevent IME action from being called multiple times with hardware keyboards.
+-     * When the hardware return key is held down, iOS sends multiple newline characters to the application,
+-     * which makes UIKitTextInputService call the current IME action multiple times without an additional
+-     * debouncing logic.
++     * When the hardware return key is held down, iOS sends multiple newline characters to the
++     * application, which makes UIKitTextInputService call the current IME action multiple times
++     * without an additional debouncing logic.
+      *
+      * @see _tempHardwareReturnKeyPressed is set to true when the return key is pressed with a
+-     * hardware keyboard.
+-     * @see _tempImeActionIsCalledWithHardwareReturnKey is set to true when the
+-     * current IME action has been called within the current hardware return key press.
++     *   hardware keyboard.
++     * @see _tempImeActionIsCalledWithHardwareReturnKey is set to true when the current IME action
++     *   has been called within the current hardware return key press.
+      */
+     private var _tempHardwareReturnKeyPressed: Boolean = false
+     private var _tempImeActionIsCalledWithHardwareReturnKey: Boolean = false
++
+     private fun handleEnterKey(event: KeyEvent): Boolean {
+         _tempImeActionIsCalledWithHardwareReturnKey = false
+         return when (event.type) {
+@@ -183,7 +188,8 @@ internal abstract class TextInputConnection(
+ 
+             KeyEventType.KeyDown -> {
+                 _tempHardwareReturnKeyPressed = true
+-                // This prevents two new line characters from being added for one hardware return key press.
++                // This prevents two new line characters from being added for one hardware return
++                // key press.
+                 true
+             }
+ 
+@@ -198,7 +204,8 @@ internal abstract class TextInputConnection(
+ 
      private fun handleEscape(event: KeyEvent): Boolean {
          return if (currentRequest != null) {
 -            if (event.type == KeyEventType.KeyDown) {
@@ -26,9 +144,31 @@ index a44bab25bf6db632f5a5bc215515a8d3779a8e86..1e2abfbcc375c7dc6962cd6e8f2cbdf7
                  focusManager()?.releaseFocus()
              }
              true
-@@ -244,8 +245,13 @@ internal abstract class TextInputConnection(
+@@ -212,36 +219,48 @@ internal abstract class TextInputConnection(
+      *
+      * The operation is executed via [PlatformTextInputMethodRequest.editText], so the change goes
+      * through the regular Compose snapshot/recomposition path. While the edit runs,
+-     * [postponeSelectionUpdate] suppresses UITextInputDelegate notifications that would otherwise
++     * [applyingEditGeneration] suppresses UITextInputDelegate notifications that would otherwise
+      * fire from the snapshot subscription and reset multi-stage IME state.
+      *
+      * @param requireUpdateView when `true`, request an immediate redraw after the edit. Some UIKit
+-     * call sites (selection-only changes, marked text updates) rely on the next animation frame
+-     * driven by Compose's normal redraw cycle and pass `false` to avoid extra work.
++     *   call sites (selection-only changes, marked text updates) rely on the next animation frame
++     *   driven by Compose's normal redraw cycle and pass `false` to avoid extra work.
+      */
+     private fun edit(
+         requireUpdateView: Boolean = true,
+-        performCommand: TextEditingScope.() -> Unit
++        performCommand: TextEditingScope.() -> Unit,
+     ) {
+         val request = currentRequest ?: return
+         val currentValue = currentTextFieldValue ?: request.stateSnapshot()
+         val commands = recordEditCommands(performCommand)
          if (commands.isEmpty()) return
-
+ 
++        editGeneration++
          pendingEditCommands += commands
 -        currentTextFieldValue =
 -            EditProcessor().also { it.reset(currentValue, null) }.apply(commands)
@@ -42,10 +182,19 @@ index a44bab25bf6db632f5a5bc215515a8d3779a8e86..1e2abfbcc375c7dc6962cd6e8f2cbdf7
          if (requireUpdateView) {
              updateView()
          }
-@@ -257,6 +263,11 @@ internal abstract class TextInputConnection(
+         if (editFlushJob == null) {
+-            editFlushJob = coroutineScope.launch {
+-                yield()
+-                flushPendingEdits()
+-            }
++            editFlushJob =
++                coroutineScope.launch {
++                    yield()
++                    flushPendingEdits()
++                }
          }
      }
-
+ 
 +    override fun flushPendingTextInputEdits() {
 +        editFlushJob?.cancel()
 +        flushPendingEdits()
@@ -54,19 +203,123 @@ index a44bab25bf6db632f5a5bc215515a8d3779a8e86..1e2abfbcc375c7dc6962cd6e8f2cbdf7
      private fun flushPendingEdits() {
          editFlushJob = null
          val request = currentRequest ?: return clearPendingEdits()
-@@ -274,6 +285,10 @@ internal abstract class TextInputConnection(
-             postponeSelectionUpdate = false
+@@ -250,15 +269,19 @@ internal abstract class TextInputConnection(
+         val commands = pendingEditCommands.toList()
+         pendingEditCommands.clear()
+         val expectedValue = currentTextFieldValue ?: request.stateSnapshot()
+-        postponeSelectionUpdate = true
++        val generation = editGeneration
++        val previousApplyingEditGeneration = applyingEditGeneration
++        applyingEditGeneration = generation
+         try {
+-            request.editText {
+-                commands.forEach(::applyEditCommand)
+-            }
++            request.editText { commands.forEach(::applyEditCommand) }
+         } finally {
+-            postponeSelectionUpdate = false
++            applyingEditGeneration = previousApplyingEditGeneration
          }
-
+ 
 +        // Applying the host edit can replace the session or reenter native editing.
 +        // In either case, its newer prediction must not be replaced by this batch.
-+        if (currentRequest !== request || pendingEditCommands.isNotEmpty()) return
++        if (currentRequest !== request || editGeneration != generation) return
 +
          val actualValue = request.stateSnapshot()
          if (actualValue == expectedValue) {
              currentTextFieldValue = actualValue
-@@ -438,8 +453,12 @@ internal abstract class TextInputConnection(
-
+@@ -271,6 +294,7 @@ internal abstract class TextInputConnection(
+     }
+ 
+     private fun clearPendingEdits() {
++        editGeneration++
+         editFlushJob?.cancel()
+         editFlushJob = null
+         pendingEditCommands.clear()
+@@ -278,11 +302,10 @@ internal abstract class TextInputConnection(
+ 
+     private fun imeActionRequired(): Boolean =
+         currentRequest?.imeOptions?.run {
+-            singleLine || (
+-                imeAction != ImeAction.None
+-                    && imeAction != ImeAction.Default
+-                    && !(imeAction == ImeAction.Search && _tempHardwareReturnKeyPressed)
+-                )
++            singleLine ||
++                (imeAction != ImeAction.None &&
++                    imeAction != ImeAction.Default &&
++                    !(imeAction == ImeAction.Search && _tempHardwareReturnKeyPressed))
+         } ?: false
+ 
+     private fun runImeActionIfRequired(): Boolean {
+@@ -305,13 +328,13 @@ internal abstract class TextInputConnection(
+     }
+ 
+     /**
+-     * Returns true if there is a focused view in the window hierarchy that is an external
+-     * text input — i.e. a native UITextField or UITextView inserted via interop, not one of
+-     * Compose's own input views.
++     * Returns true if there is a focused view in the window hierarchy that is an external text
++     * input — i.e. a native UITextField or UITextView inserted via interop, not one of Compose's
++     * own input views.
+      *
+-     * Used to distinguish the case where the user tapped a native interop text field (in which
+-     * case Compose focus should be released) from the case where focus simply moved to another
+-     * Compose text field (in which case Compose handles focus internally and no action is needed).
++     * Used to distinguish the case where the user tapped a native interop text field (in which case
++     * Compose focus should be released) from the case where focus simply moved to another Compose
++     * text field (in which case Compose handles focus internally and no action is needed).
+      */
+     private fun hasFocusedExternalInputViewInWindowHierarchy(): Boolean {
+         fun hasFocusedExternalInputView(view: UIView): Boolean {
+@@ -343,9 +366,7 @@ internal abstract class TextInputConnection(
+         val offsetPx = offset.toOffset(view.density)
+         val pos = textLayoutResult?.getOffsetForPosition(offsetPx + translation) ?: return
+ 
+-        edit(requireUpdateView = false) {
+-            setSelection(pos, pos)
+-        }
++        edit(requireUpdateView = false) { setSelection(pos, pos) }
+     }
+ 
+     override fun beginFloatingCursor(offset: DpOffset) {
+@@ -366,20 +387,14 @@ internal abstract class TextInputConnection(
+                 return
+             }
+         }
+-        edit {
+-            commitText(text, 1)
+-        }
++        edit { commitText(text, 1) }
+     }
+ 
+     override fun deleteBackward() {
+         if (currentTextFieldValue?.selection?.collapsed == true) {
+-            edit {
+-                deleteSurroundingTextInCodePoints(1, 0)
+-            }
++            edit { deleteSurroundingTextInCodePoints(1, 0) }
+         } else {
+-            edit {
+-                commitText("", 0)
+-            }
++            edit { commitText("", 0) }
+         }
+     }
+ 
+@@ -398,9 +413,7 @@ internal abstract class TextInputConnection(
+     }
+ 
+     override fun selectAll() {
+-        edit {
+-            setSelection(0, endOfDocument())
+-        }
++        edit { setSelection(0, endOfDocument()) }
+     }
+ 
+     override fun textInRange(range: TextRange): String? {
+@@ -421,8 +434,12 @@ internal abstract class TextInputConnection(
+ 
      override fun setMarkedText(markedText: String?, selectedRange: TextRange) {
          if (markedText != null) {
 +            val value = currentTextFieldValue ?: return
@@ -78,6 +331,122 @@ index a44bab25bf6db632f5a5bc215515a8d3779a8e86..1e2abfbcc375c7dc6962cd6e8f2cbdf7
              }
          }
      }
+@@ -432,9 +449,7 @@ internal abstract class TextInputConnection(
+     }
+ 
+     override fun unmarkText() {
+-        edit {
+-            finishComposingText()
+-        }
++        edit { finishComposingText() }
+     }
+ 
+     override fun positionFromPosition(position: Int, offset: Int): Int? {
+@@ -452,11 +467,12 @@ internal abstract class TextInputConnection(
+         iterator.setText(text)
+ 
+         repeat(offset.absoluteValue) {
+-            val iteratorResult = if (offset > 0) {
+-                iterator.following(resultPosition)
+-            } else {
+-                iterator.preceding(resultPosition)
+-            }
++            val iteratorResult =
++                if (offset > 0) {
++                    iterator.following(resultPosition)
++                } else {
++                    iterator.preceding(resultPosition)
++                }
+ 
+             if (iteratorResult == BreakIterator.DONE) {
+                 return resultPosition
+@@ -482,9 +498,7 @@ internal abstract class TextInputConnection(
+             else -> {
+                 val targetLineEnd = layoutResult.getLineEnd(targetLine)
+                 val lineStart = layoutResult.getLineStart(targetLine)
+-                positionFromPosition(
+-                    lineStart, min(offsetInLine, targetLineEnd - lineStart)
+-                )
++                positionFromPosition(lineStart, min(offsetInLine, targetLineEnd - lineStart))
+             }
+         }
+     }
+@@ -510,51 +524,42 @@ internal abstract class TextInputConnection(
+     }
+ }
+ 
+-private fun recordEditCommands(
+-    block: TextEditingScope.() -> Unit
+-): List<EditCommand> = buildList {
++private fun recordEditCommands(block: TextEditingScope.() -> Unit): List<EditCommand> = buildList {
+     object : TextEditingScope {
+-        override fun deleteSurroundingTextInCodePoints(
+-            lengthBeforeCursor: Int,
+-            lengthAfterCursor: Int,
+-        ) {
+-            add(
+-                DeleteSurroundingTextInCodePointsCommand(
+-                    lengthBeforeCursor,
+-                    lengthAfterCursor,
+-                )
+-            )
+-        }
++            override fun deleteSurroundingTextInCodePoints(
++                lengthBeforeCursor: Int,
++                lengthAfterCursor: Int,
++            ) {
++                add(DeleteSurroundingTextInCodePointsCommand(lengthBeforeCursor, lengthAfterCursor))
++            }
+ 
+-        override fun setSelection(start: Int, end: Int) {
+-            add(SetSelectionCommand(start, end))
+-        }
++            override fun setSelection(start: Int, end: Int) {
++                add(SetSelectionCommand(start, end))
++            }
+ 
+-        override fun commitText(text: CharSequence, newCursorPosition: Int) {
+-            add(CommitTextCommand(text.toString(), newCursorPosition))
+-        }
++            override fun commitText(text: CharSequence, newCursorPosition: Int) {
++                add(CommitTextCommand(text.toString(), newCursorPosition))
++            }
+ 
+-        override fun setComposingRegion(start: Int, end: Int) {
+-            add(SetComposingRegionCommand(start, end))
+-        }
++            override fun setComposingRegion(start: Int, end: Int) {
++                add(SetComposingRegionCommand(start, end))
++            }
+ 
+-        override fun setComposingText(text: CharSequence, newCursorPosition: Int) {
+-            add(SetComposingTextCommand(text.toString(), newCursorPosition))
+-        }
++            override fun setComposingText(text: CharSequence, newCursorPosition: Int) {
++                add(SetComposingTextCommand(text.toString(), newCursorPosition))
++            }
+ 
+-        override fun finishComposingText() {
+-            add(FinishComposingTextCommand())
++            override fun finishComposingText() {
++                add(FinishComposingTextCommand())
++            }
+         }
+-    }.block()
++        .block()
+ }
+ 
+ private fun TextEditingScope.applyEditCommand(command: EditCommand) {
+     when (command) {
+         is DeleteSurroundingTextInCodePointsCommand ->
+-            deleteSurroundingTextInCodePoints(
+-                command.lengthBeforeCursor,
+-                command.lengthAfterCursor,
+-            )
++            deleteSurroundingTextInCodePoints(command.lengthBeforeCursor, command.lengthAfterCursor)
+         is SetSelectionCommand -> setSelection(command.start, command.end)
+         is CommitTextCommand -> commitText(command.text, command.newCursorPosition)
+         is SetComposingRegionCommand -> setComposingRegion(command.start, command.end)
 diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt
 index 1f99b5398141aa453265e3fb34b5919498dc3bc6..64375e16be9d27b4d4e6c2fcc4fb879d81a8f9f2 100644
 --- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt
@@ -93,7 +462,7 @@ index 1f99b5398141aa453265e3fb34b5919498dc3bc6..64375e16be9d27b4d4e6c2fcc4fb879d
 @@ -90,6 +91,13 @@ internal class ComposeTextInputView(
      private val inputTraits: SkikoUITextInputTraits
          get() = input?.inputTraits ?: EmptyInputTraits
-
+ 
 +    // Native editing integrations can establish an explicit boundary without waiting
 +    // for the next run-loop turn or changing the batching of ordinary IME callbacks.
 +    @ObjCAction
@@ -103,15 +472,15 @@ index 1f99b5398141aa453265e3fb34b5919498dc3bc6..64375e16be9d27b4d4e6c2fcc4fb879d
 +
      override fun inputView(): UIView? = inputTraits.inputView()
      override fun inputAccessoryView(): UIView? = inputTraits.inputAccessoryView()
-
+ 
 diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
-index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..a1c010887edd6a14584d01644d1b92f0bf812b8a 100644
+index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..d4fdac0cea2c887bb8a7604b4fa94f9ffc644ac8 100644
 --- a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
 +++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
-@@ -16,13 +16,28 @@
-
+@@ -16,24 +16,378 @@
+ 
  package androidx.compose.ui.text.input
-
+ 
 +import androidx.compose.ui.InternalComposeUiApi
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.focus.FocusRequester
@@ -137,10 +506,13 @@ index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..a1c010887edd6a14584d01644d1b92f0
  import kotlinx.cinterop.ExperimentalForeignApi
  import kotlinx.cinterop.readValue
  import kotlinx.coroutines.CoroutineScope
-@@ -32,8 +47,239 @@ import kotlinx.coroutines.test.runTest
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.launch
+ import kotlinx.coroutines.test.runCurrent
+ import kotlinx.coroutines.test.runTest
  import platform.CoreGraphics.CGRectZero
  import platform.UIKit.UIView
-
+ 
 -@OptIn(ExperimentalForeignApi::class, ExperimentalCoroutinesApi::class)
 +@OptIn(ExperimentalForeignApi::class, ExperimentalCoroutinesApi::class, InternalComposeUiApi::class)
  class TextInputConnectionIosTest {
@@ -155,14 +527,20 @@ index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..a1c010887edd6a14584d01644d1b92f0
 +        inputView.flushPendingTextInputEdits()
 +
 +        assertEquals(TextFieldValue("ab", TextRange(1)), request.value())
-+        assertEquals(listOf(listOf<EditCommand>(SetSelectionCommand(1, 1))), request.dispatchedCommands)
++        assertEquals(
++            listOf(listOf<EditCommand>(SetSelectionCommand(1, 1))),
++            request.dispatchedCommands,
++        )
 +
 +        connection.insertText("X")
 +        runCurrent()
 +
 +        assertEquals(TextFieldValue("aXb", TextRange(2)), request.value())
 +        assertEquals(
-+            listOf(listOf<EditCommand>(SetSelectionCommand(1, 1)), listOf<EditCommand>(CommitTextCommand("X", 1))),
++            listOf(
++                listOf<EditCommand>(SetSelectionCommand(1, 1)),
++                listOf<EditCommand>(CommitTextCommand("X", 1)),
++            ),
 +            request.dispatchedCommands,
 +        )
 +        assertEquals(emptyList(), connection.stateDidChanges)
@@ -209,6 +587,94 @@ index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..a1c010887edd6a14584d01644d1b92f0
 +
 +        assertEquals(TextFieldValue("aXYb", TextRange(3)), request.value())
 +        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun nestedNativeFlushDoesNotNotifyAnExternalChangeForTheOlderBatch() = runTest {
++        val request = TestRequest(TextFieldValue("ab", TextRange(2)))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++        request.afterEdit = {
++            request.afterEdit = {}
++            connection.insertText("X")
++            connection.flushPendingTextInputEdits()
++        }
++
++        connection.setSelectedTextRange(TextRange(1))
++        connection.flushPendingTextInputEdits()
++        connection.insertText("Y")
++        runCurrent()
++
++        assertEquals(TextFieldValue("aXYb", TextRange(3)), request.value())
++        assertEquals(TextRange(3), connection.getSelectedTextRange())
++        assertEquals(emptyList(), connection.stateWillChanges)
++        assertEquals(emptyList(), connection.stateDidChanges)
++    }
++
++    @Test
++    fun nestedNativeFlushStillNotifiesARealHostTransformationOnce() = runTest {
++        val request = TestRequest(TextFieldValue("ab", TextRange(2)))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++        request.afterEdit = {
++            request.afterEdit = { connection.onTextFieldValueUpdated(request.value()) }
++            request.resultOverride = TextFieldValue("aZb", TextRange(2))
++            connection.insertText("X")
++            connection.flushPendingTextInputEdits()
++            request.resultOverride = null
++        }
++
++        connection.setSelectedTextRange(TextRange(1))
++        connection.flushPendingTextInputEdits()
++        connection.insertText("Y")
++        runCurrent()
++
++        assertEquals(TextFieldValue("aZYb", TextRange(3)), request.value())
++        assertEquals(listOf(true to true), connection.stateWillChanges)
++        assertEquals(listOf(true to true), connection.stateDidChanges)
++    }
++
++    @Test
++    fun hostEditAfterNestedFlushNotifiesWithSynchronousSnapshot() =
++        hostEditAfterNestedFlushNotifies(synchronousSnapshot = true)
++
++    @Test
++    fun hostEditAfterNestedFlushNotifiesWithDeferredSnapshot() =
++        hostEditAfterNestedFlushNotifies(synchronousSnapshot = false)
++
++    private fun hostEditAfterNestedFlushNotifies(synchronousSnapshot: Boolean) = runTest {
++        val request = TestRequest(TextFieldValue("ab", TextRange(2)))
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
++        connection.start(request)
++        request.afterEdit = {
++            request.afterEdit = { connection.onTextFieldValueUpdated(request.value()) }
++            connection.insertText("X")
++            connection.flushPendingTextInputEdits()
++            request.afterEdit = {}
++
++            // The host changes its value after the nested native batch has completed.
++            request.editText { commitText("Y", 1) }
++            if (synchronousSnapshot) {
++                connection.onTextFieldValueUpdated(request.value())
++            } else {
++                launch { connection.onTextFieldValueUpdated(request.value()) }
++            }
++        }
++
++        connection.setSelectedTextRange(TextRange(1))
++        connection.flushPendingTextInputEdits()
++        runCurrent()
++
++        assertEquals(TextFieldValue("aXYb", TextRange(3)), request.value())
++        assertEquals("aXYb", connection.textInRange(TextRange(0, connection.endOfDocument())))
++        assertEquals(TextRange(3), connection.getSelectedTextRange())
++
++        connection.insertText("Z")
++        runCurrent()
++
++        assertEquals(TextFieldValue("aXYZb", TextRange(4)), request.value())
++        assertEquals(listOf(true to true), connection.stateWillChanges)
++        assertEquals(listOf(true to true), connection.stateDidChanges)
 +    }
 +
 +    @Test
@@ -277,11 +743,15 @@ index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..a1c010887edd6a14584d01644d1b92f0
 +    fun escapeKeepsFocusUntilANewPressAfterCompositionEnds() = runTest {
 +        val frameRecomposer = FrameRecomposer(coroutineContext)
 +        val scene = CanvasLayersComposeScene(frameRecomposer = frameRecomposer)
-+        val connection = TestTextInputConnection(CoroutineScope(coroutineContext)) { scene.focusManager }
++        val connection =
++            TestTextInputConnection(CoroutineScope(coroutineContext)) { scene.focusManager }
 +        try {
 +            val focusRequester = FocusRequester()
 +            scene.setContent {
-+                Layout(content = {}, modifier = Modifier.focusRequester(focusRequester).focusTarget()) { _, _ ->
++                Layout(
++                    content = {},
++                    modifier = Modifier.focusRequester(focusRequester).focusTarget(),
++                ) { _, _ ->
 +                    layout(10, 10) {}
 +                }
 +            }
@@ -323,7 +793,10 @@ index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..a1c010887edd6a14584d01644d1b92f0
 +
 +        for (markedText in listOf("n", "に", "にh", "にほ")) {
 +            connection.setMarkedText(markedText, TextRange(markedText.length))
-+            assertEquals("a${markedText}b", connection.textInRange(TextRange(0, connection.endOfDocument())))
++            assertEquals(
++                "a${markedText}b",
++                connection.textInRange(TextRange(0, connection.endOfDocument())),
++            )
 +            assertEquals(TextRange(1, 1 + markedText.length), connection.markedTextRange())
 +            assertEquals(TextRange(1 + markedText.length), connection.getSelectedTextRange())
 +        }
@@ -343,13 +816,19 @@ index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..a1c010887edd6a14584d01644d1b92f0
 +
 +        for (markedText in listOf("n", "に", "にh", "にほ", "にほん", "日本語")) {
 +            // The host replaces its entire marked range, independently of the predictor.
-+            request.resultOverride = TextFieldValue(
-+                "a${markedText}b", TextRange(1 + markedText.length), TextRange(1, 1 + markedText.length)
-+            )
++            request.resultOverride =
++                TextFieldValue(
++                    "a${markedText}b",
++                    TextRange(1 + markedText.length),
++                    TextRange(1, 1 + markedText.length),
++                )
 +            connection.setMarkedText(markedText, TextRange(markedText.length))
 +            runCurrent()
 +
-+            assertEquals("a${markedText}b", connection.textInRange(TextRange(0, connection.endOfDocument())))
++            assertEquals(
++                "a${markedText}b",
++                connection.textInRange(TextRange(0, connection.endOfDocument())),
++            )
 +            assertEquals(TextRange(1, 1 + markedText.length), connection.markedTextRange())
 +            assertEquals(emptyList(), connection.stateWillChanges)
 +            assertEquals(emptyList(), connection.stateDidChanges)
@@ -378,37 +857,108 @@ index adef415a1c8a63fe8d7df93d3e8ca8103bcea9ad..a1c010887edd6a14584d01644d1b92f0
      @Test
      fun nativeEditsInTheSameTurnAreDispatchedAsOneEdit() = runTest {
          val request = TestRequest(TextFieldValue("ab", TextRange(2)))
-@@ -140,15 +386,16 @@ class TextInputConnectionIosTest {
+@@ -48,12 +402,7 @@ class TextInputConnectionIosTest {
+         runCurrent()
+ 
+         assertEquals(
+-            listOf(
+-                listOf(
+-                    SetSelectionCommand(0, 2),
+-                    CommitTextCommand("c", 1),
+-                )
+-            ),
++            listOf(listOf(SetSelectionCommand(0, 2), CommitTextCommand("c", 1))),
+             request.dispatchedCommands,
+         )
+         assertEquals(TextFieldValue("c", TextRange(1)), request.value())
+@@ -84,20 +433,12 @@ class TextInputConnectionIosTest {
+         val connection = TestTextInputConnection(CoroutineScope(coroutineContext))
+         connection.start(
+             TestRequest(
+-                TextFieldValue(
+-                    text = "하",
+-                    selection = TextRange(1),
+-                    composition = TextRange(0, 1),
+-                )
++                TextFieldValue(text = "하", selection = TextRange(1), composition = TextRange(0, 1))
+             )
+         )
+ 
+         connection.onTextFieldValueUpdated(
+-            TextFieldValue(
+-                text = "하",
+-                selection = TextRange(1),
+-                composition = null,
+-            )
++            TextFieldValue(text = "하", selection = TextRange(1), composition = null)
+         )
+ 
+         assertEquals(listOf(true to true), connection.stateWillChanges)
+@@ -140,16 +481,18 @@ class TextInputConnectionIosTest {
      }
  }
-
+ 
 -@OptIn(ExperimentalForeignApi::class)
 +@OptIn(ExperimentalForeignApi::class, InternalComposeUiApi::class)
  private class TestTextInputConnection(
      scope: CoroutineScope,
-+    focusManager: () -> ComposeSceneFocusManager? = { null },
- ) : TextInputConnection(
-     updateView = {},
-     view = UIView(frame = CGRectZero.readValue()),
-     coroutineScope = scope,
-     focusedViewsList = null,
+-) : TextInputConnection(
+-    updateView = {},
+-    view = UIView(frame = CGRectZero.readValue()),
+-    coroutineScope = scope,
+-    focusedViewsList = null,
 -    focusManager = { null },
-+    focusManager = focusManager,
- ) {
+-) {
++    focusManager: () -> ComposeSceneFocusManager? = { null },
++) :
++    TextInputConnection(
++        updateView = {},
++        view = UIView(frame = CGRectZero.readValue()),
++        coroutineScope = scope,
++        focusedViewsList = null,
++        focusManager = focusManager,
++    ) {
      val stateWillChanges = mutableListOf<Pair<Boolean, Boolean>>()
      val stateDidChanges = mutableListOf<Pair<Boolean, Boolean>>()
-@@ -188,6 +435,7 @@ private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMetho
-
+ 
+@@ -179,7 +522,8 @@ private class TestTextInputConnection(
+         paste: (() -> Unit)?,
+         cut: (() -> Unit)?,
+         selectAll: (() -> Unit)?,
+-        customActions: List<androidx.compose.ui.platform.UIKitNativeTextInputContextMenuCustomAction>?,
++        customActions:
++            List<androidx.compose.ui.platform.UIKitNativeTextInputContextMenuCustomAction>?,
+     ) = Unit
+ }
+ 
+@@ -188,6 +532,7 @@ private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMetho
+ 
      val dispatchedCommands = mutableListOf<List<EditCommand>>()
      var resultOverride: TextFieldValue? = null
 +    var afterEdit: () -> Unit = {}
-
+ 
      override val value: () -> TextFieldValue = { fieldValue }
-
-@@ -234,5 +482,6 @@ private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMetho
+ 
+@@ -232,8 +577,8 @@ private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMetho
+         TestTextEditingScope(commands).block()
+         dispatchedCommands += commands
          fieldValue =
-             resultOverride
-                 ?: EditProcessor().also { it.reset(fieldValue, null) }.apply(commands)
+-            resultOverride
+-                ?: EditProcessor().also { it.reset(fieldValue, null) }.apply(commands)
++            resultOverride ?: EditProcessor().also { it.reset(fieldValue, null) }.apply(commands)
 +        afterEdit()
      }
  }
+ 
+@@ -244,10 +589,7 @@ private fun TestTextEditingScope(commands: MutableList<EditCommand>) =
+             lengthAfterCursor: Int,
+         ) {
+             commands +=
+-                DeleteSurroundingTextInCodePointsCommand(
+-                    lengthBeforeCursor,
+-                    lengthAfterCursor,
+-                )
++                DeleteSurroundingTextInCodePointsCommand(lengthBeforeCursor, lengthAfterCursor)
+         }
+ 
+         override fun setSelection(start: Int, end: Int) {

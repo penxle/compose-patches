@@ -10,6 +10,9 @@
       ":compose:ui:ui:iosSimulatorArm64Test",
       "--tests",
       "androidx.compose.ui.text.input.TextInputConnectionIosTest"
+    ],
+    [
+      ":compose:ui:ui:compileKotlinIosArm64"
     ]
   ]
 }

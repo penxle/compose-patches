@@ -11,7 +11,12 @@
       "--tests",
       "androidx.compose.ui.text.input.HardwareKeyboardRepeatBridgeTest",
       "--tests",
-      "androidx.compose.ui.scene.HardwareKeyboardRoutingPolicyTest"
+      "androidx.compose.ui.scene.HardwareKeyboardRoutingPolicyTest",
+      "--tests",
+      "androidx.compose.ui.text.input.TextInputConnectionIosTest"
+    ],
+    [
+      ":compose:ui:ui:compileKotlinIosArm64"
     ]
   ]
 }
