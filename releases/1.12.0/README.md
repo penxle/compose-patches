@@ -26,22 +26,30 @@ Apply these after the August baseline, in order:
 2. `ios-hardware-keyboard-native-repeat`: hardware-key ownership and repetition,
    previously split between `ios-hardware-keyboard-native-repeat`
    and `ios-hardware-keyboard-state-transitions`.
+3. `ios-text-input-view-lifecycle`: explicit UIKit input-view attachment and
+   detachment callbacks, including cancellation and reentrant request replacement.
+   Typie uses these callbacks to install its bridges without first-responder
+   traversal or delayed retries.
 
 The first follow-up can be applied without the second. The second patch is based
-on the first, including its input-test fixture. Keep this dependency when
-updating or removing patches.
+on the first, including its input-test fixture. The lifecycle patch is
+based on both and can be removed independently, together with Typie's request
+wrapper that consumes its API.
 
-The consolidated stack produces exactly the same source files and tests as the
-previous seven-patch release plus the reviewed, uncommitted reentrant-flush patch.
+The consolidation of the first two follow-ups produced exactly the same source
+files and tests as the previous seven-patch release plus the reviewed,
+uncommitted reentrant-flush patch.
 No implementation changes or tests are dropped during consolidation. Earlier
 published patch revisions remain in Git history; they are not rewritten.
 
 ## Source rollback
 
-To restore the August source baseline, remove both September follow-up IDs from
+To restore the August source baseline, remove all three September follow-up IDs from
 `release.json`, leaving the first four IDs unchanged. When reversing patches in
-an already-patched checkout, reverse hardware handling before IME synchronization.
-Removing only hardware handling leaves the IME fixes available.
+an already-patched checkout, reverse lifecycle handling first, then hardware handling,
+then IME synchronization.
+After removing lifecycle handling, hardware handling can also be removed while
+leaving the IME fixes available.
 
 Verified Git source-tree IDs at the consolidation boundary:
 

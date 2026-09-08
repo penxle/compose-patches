@@ -1,0 +1,392 @@
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+index 3c089a9f3b8b7fc0f0804c0a4c5c40edea76cd7f..af782a7920f18532dadfdf95d0bb722bc2a87175 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+@@ -27,6 +27,7 @@ import androidx.compose.ui.platform.PlatformTextInputMethodRequest
+ import androidx.compose.ui.platform.SkikoUITextInputTraits
+ import androidx.compose.ui.platform.TextEditingDelegate
+ import androidx.compose.ui.platform.UIKitNativeTextInputContextMenuCustomAction
++import androidx.compose.ui.platform.UIKitTextInputMethodRequest
+ import androidx.compose.ui.platform.getUITextInputTraits
+ import androidx.compose.ui.scene.ComposeSceneFocusManager
+ import androidx.compose.ui.text.TextRange
+@@ -71,6 +72,8 @@ internal abstract class TextInputConnection(
+ 
+     private var floatingCursorTranslation: Offset? = null
+     private var currentRequest: PlatformTextInputMethodRequest? = null
++    // Only requests whose attachment callback has returned are ready for stop() to detach.
++    private var attachedRequest: UIKitTextInputMethodRequest? = null
+     private val pendingEditCommands = mutableListOf<EditCommand>()
+     private var editGeneration = 0L
+     private var editFlushJob: Job? = null
+@@ -90,17 +93,36 @@ internal abstract class TextInputConnection(
+         get() = currentRequest?.textFieldRectInRoot()
+ 
+     fun start(request: PlatformTextInputMethodRequest) {
++        val previousRequest = attachedRequest
++        attachedRequest = null
+         clearPendingEdits()
+         currentRequest = request
++        // Release integration without detaching the reused view. Cleanup can reenter start/stop.
++        previousRequest?.onTextInputViewDetached(textInputView)
++        if (currentRequest !== request) return
++
+         currentTextFieldValue = request.stateSnapshot()
+         inputTraits = getUITextInputTraits(request.imeOptions)
+         attachInputToView()
++        // UIKit focus callbacks can stop or replace the request before integration is attached.
++        if (currentRequest !== request) return
++
++        val attachment = request as? UIKitTextInputMethodRequest
++        attachment?.onTextInputViewAttached(textInputView)
++        if (currentRequest !== request) {
++            // Finish installing before cleanup, even if the callback reentered stop().
++            attachment?.onTextInputViewDetached(textInputView)
++            return
++        }
++        attachedRequest = attachment
+         showKeyboard()
+     }
+ 
+     protected abstract fun attachInputToView()
+ 
+     open fun stop() {
++        val attachment = attachedRequest
++        attachedRequest = null
+         hardwareKeyboardRepeatBridge.reset()
+         clearPendingEdits()
+         currentRequest = null
+@@ -110,6 +132,7 @@ internal abstract class TextInputConnection(
+         dismissKeyboard()
+ 
+         detachView()
++        attachment?.onTextInputViewDetached(textInputView)
+     }
+ 
+     protected abstract fun detachView()
+diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
+index 09503b06b953dea39fd4f1474d31fc95b62a8aaa..d55160e8c5e72352d4d5073fa618f4ad34d7eadd 100644
+--- a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
++++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
+@@ -29,6 +29,7 @@ import androidx.compose.ui.input.key.KeyEventType
+ import androidx.compose.ui.layout.Layout
+ import androidx.compose.ui.platform.FrameRecomposer
+ import androidx.compose.ui.platform.PlatformTextInputMethodRequest
++import androidx.compose.ui.platform.UIKitTextInputMethodRequest
+ import androidx.compose.ui.scene.CanvasLayersComposeScene
+ import androidx.compose.ui.scene.ComposeSceneFocusManager
+ import androidx.compose.ui.text.TextLayoutResult
+@@ -50,6 +51,175 @@ import platform.UIKit.UIView
+ 
+ @OptIn(ExperimentalForeignApi::class, ExperimentalCoroutinesApi::class, InternalComposeUiApi::class)
+ class TextInputConnectionIosTest {
++    @Test
++    fun inputViewLifecycleEnclosesKeyboardPresentationAndDoesNotOutliveConnection() = runTest {
++        val events = mutableListOf<String>()
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext), events = events)
++        val request =
++            object :
++                PlatformTextInputMethodRequest by TestRequest(TextFieldValue()),
++                UIKitTextInputMethodRequest {
++                override fun onTextInputViewAttached(view: UIView) {
++                    assertTrue(view === connection.textInputView)
++                    events += "attached"
++                }
++
++                override fun onTextInputViewDetached(view: UIView) {
++                    assertTrue(view === connection.textInputView)
++                    events += "detached"
++                }
++            }
++        connection.start(request)
++        assertEquals(listOf("connect", "attached", "show"), events)
++        events.clear()
++        connection.stop()
++        assertEquals(listOf("hide", "disconnect", "detached"), events)
++        events.clear()
++        connection.stop()
++        assertFalse("detached" in events)
++    }
++
++    @Test
++    fun replacingRequestReleasesPreviousIntegrationWithoutDetachingReusedView() = runTest {
++        val events = mutableListOf<String>()
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext), events = events)
++        fun request(name: String) =
++            object :
++                PlatformTextInputMethodRequest by TestRequest(TextFieldValue()),
++                UIKitTextInputMethodRequest {
++                override fun onTextInputViewAttached(view: UIView) {
++                    events += "$name attached"
++                }
++
++                override fun onTextInputViewDetached(view: UIView) {
++                    events += "$name detached"
++                }
++            }
++        connection.start(request("old"))
++        events.clear()
++        connection.start(request("new"))
++        assertEquals(listOf("old detached", "connect", "new attached", "show"), events)
++        events.clear()
++        connection.stop()
++        assertEquals(listOf("hide", "disconnect", "new detached"), events)
++    }
++
++    @Test
++    fun stoppingWhileConnectingViewDoesNotNotifyAnUnattachedRequest() = runTest {
++        val events = mutableListOf<String>()
++        val connection =
++            object : TestTextInputConnection(CoroutineScope(coroutineContext), events) {
++                override fun attachInputToView() {
++                    super.attachInputToView()
++                    stop()
++                }
++            }
++        val request =
++            object :
++                PlatformTextInputMethodRequest by TestRequest(TextFieldValue()),
++                UIKitTextInputMethodRequest {
++                override fun onTextInputViewAttached(view: UIView) {
++                    events += "attached"
++                }
++
++                override fun onTextInputViewDetached(view: UIView) {
++                    events += "detached"
++                }
++            }
++
++        connection.start(request)
++
++        assertEquals(listOf("connect", "hide", "disconnect"), events)
++    }
++
++    @Test
++    fun replacingWhileConnectingViewDoesNotAttachTheSupersededRequest() = runTest {
++        val events = mutableListOf<String>()
++        val replacement = TestRequest(TextFieldValue("new", TextRange(3)))
++        val connection =
++            object : TestTextInputConnection(CoroutineScope(coroutineContext), events) {
++                private var firstConnection = true
++
++                override fun attachInputToView() {
++                    super.attachInputToView()
++                    if (firstConnection) {
++                        firstConnection = false
++                        start(replacement)
++                    }
++                }
++            }
++        val request =
++            object :
++                PlatformTextInputMethodRequest by TestRequest(TextFieldValue()),
++                UIKitTextInputMethodRequest {
++                override fun onTextInputViewAttached(view: UIView) {
++                    events += "attached"
++                }
++
++                override fun onTextInputViewDetached(view: UIView) {
++                    events += "detached"
++                }
++            }
++
++        connection.start(request)
++        assertEquals(listOf("connect", "connect", "show"), events)
++        connection.insertText("!")
++        runCurrent()
++        assertEquals("new!", replacement.value().text)
++    }
++
++    @Test
++    fun replacementDuringDetachmentIsNotOverwrittenByTheOuterStart() = runTest {
++        val events = mutableListOf<String>()
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext), events)
++        val replacement = TestRequest(TextFieldValue("new", TextRange(3)))
++        val request =
++            object :
++                PlatformTextInputMethodRequest by TestRequest(TextFieldValue()),
++                UIKitTextInputMethodRequest {
++                override fun onTextInputViewAttached(view: UIView) = Unit
++
++                override fun onTextInputViewDetached(view: UIView) {
++                    events += "detached"
++                    connection.start(replacement)
++                }
++            }
++        connection.start(request)
++        events.clear()
++
++        connection.start(TestRequest(TextFieldValue("superseded")))
++
++        assertEquals(listOf("detached", "connect", "show"), events)
++        connection.insertText("!")
++        runCurrent()
++        assertEquals("new!", replacement.value().text)
++    }
++
++    @Test
++    fun stoppingDuringAttachmentReleasesIntegrationAfterInstallationCompletes() = runTest {
++        val events = mutableListOf<String>()
++        val connection = TestTextInputConnection(CoroutineScope(coroutineContext), events = events)
++        var integrationInstalled = false
++        val request =
++            object :
++                PlatformTextInputMethodRequest by TestRequest(TextFieldValue()),
++                UIKitTextInputMethodRequest {
++                override fun onTextInputViewAttached(view: UIView) {
++                    events += "attached"
++                    connection.stop()
++                    integrationInstalled = true
++                }
++
++                override fun onTextInputViewDetached(view: UIView) {
++                    events += "detached"
++                    integrationInstalled = false
++                }
++            }
++        connection.start(request)
++        assertEquals(listOf("connect", "attached", "hide", "disconnect", "detached"), events)
++        assertFalse(integrationInstalled)
++    }
++
+     @Test
+     fun nativeSelectionAfterAnotherKeyIsNotConsumedAsVerticalRepeat() = runTest {
+         val request = TestRequest(TextFieldValue("abcd", TextRange(3)))
+@@ -505,8 +675,9 @@ class TextInputConnectionIosTest {
+ }
+ 
+ @OptIn(ExperimentalForeignApi::class, InternalComposeUiApi::class)
+-private class TestTextInputConnection(
++private open class TestTextInputConnection(
+     scope: CoroutineScope,
++    private val events: MutableList<String> = mutableListOf(),
+     focusManager: () -> ComposeSceneFocusManager? = { null },
+ ) :
+     TextInputConnection(
+@@ -519,16 +690,24 @@ private class TestTextInputConnection(
+     val stateWillChanges = mutableListOf<Pair<Boolean, Boolean>>()
+     val stateDidChanges = mutableListOf<Pair<Boolean, Boolean>>()
+ 
+-    override val textInputView: UIView
++    public override val textInputView: UIView
+         get() = view
+ 
+-    override fun attachInputToView() = Unit
++    override fun attachInputToView() {
++        events += "connect"
++    }
+ 
+-    override fun detachView() = Unit
++    override fun detachView() {
++        events += "disconnect"
++    }
+ 
+-    override fun showKeyboard() = Unit
++    override fun showKeyboard() {
++        events += "show"
++    }
+ 
+-    override fun dismissKeyboard() = Unit
++    override fun dismissKeyboard() {
++        events += "hide"
++    }
+ 
+     override fun stateWillChange(textChanged: Boolean, selectionChanged: Boolean) {
+         stateWillChanges += textChanged to selectionChanged
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputMethodRequest.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputMethodRequest.ios.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..3bf83d3d802da706ac2289339438f1fcdef96ebe
+--- /dev/null
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputMethodRequest.ios.kt
+@@ -0,0 +1,41 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package androidx.compose.ui.platform
++
++import androidx.compose.ui.ExperimentalComposeUiApi
++import platform.UIKit.UIView
++
++/**
++ * A text input request that integrates with its UIKit text input view.
++ *
++ * The view belongs to Compose. Callbacks may configure session-specific integration, but must not
++ * remove the view or change its input connection. Requests without this interface are unaffected.
++ *
++ * @sample androidx.compose.ui.samples.UIKitTextInputMethodRequestSample
++ */
++@ExperimentalComposeUiApi
++interface UIKitTextInputMethodRequest : PlatformTextInputMethodRequest {
++    /** Called after the input view is connected, before Compose requests keyboard presentation. */
++    fun onTextInputViewAttached(view: UIView)
++
++    /**
++     * Called once for each completed [onTextInputViewAttached] when this request stops using the
++     * input view, including request replacement. If the connection ends during attachment, cleanup
++     * runs immediately after the attachment callback returns, never before or inside it.
++     */
++    fun onTextInputViewDetached(view: UIView)
++}
+diff --git a/compose/ui/ui/samples/src/iosMain/kotlin/androidx/compose/ui/samples/UIKitTextInputMethodRequestSample.kt b/compose/ui/ui/samples/src/iosMain/kotlin/androidx/compose/ui/samples/UIKitTextInputMethodRequestSample.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e6adbcfca37e6ffd06ca6e38c6fddc00d4da6c2
+--- /dev/null
++++ b/compose/ui/ui/samples/src/iosMain/kotlin/androidx/compose/ui/samples/UIKitTextInputMethodRequestSample.kt
+@@ -0,0 +1,44 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package androidx.compose.ui.samples
++
++import androidx.annotation.Sampled
++import androidx.compose.ui.ExperimentalComposeUiApi
++import androidx.compose.ui.platform.PlatformTextInputMethodRequest
++import androidx.compose.ui.platform.PlatformTextInputSessionScope
++import androidx.compose.ui.platform.UIKitTextInputMethodRequest
++import platform.UIKit.UIView
++
++@Sampled
++@OptIn(ExperimentalComposeUiApi::class)
++suspend fun PlatformTextInputSessionScope.UIKitTextInputMethodRequestSample(
++    request: PlatformTextInputMethodRequest,
++    connect: (UIView) -> Unit,
++    disconnect: (UIView) -> Unit,
++) {
++    startInputMethod(
++        object : PlatformTextInputMethodRequest by request, UIKitTextInputMethodRequest {
++            override fun onTextInputViewAttached(view: UIView) {
++                connect(view)
++            }
++
++            override fun onTextInputViewDetached(view: UIView) {
++                disconnect(view)
++            }
++        }
++    )
++}
