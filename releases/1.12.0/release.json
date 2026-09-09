@@ -10,7 +10,8 @@
     "ios-zero-duration-keyboard-frame",
     "ios-text-input-composition-sync",
     "ios-hardware-keyboard-native-repeat",
-    "ios-text-input-view-lifecycle"
+    "ios-text-input-view-lifecycle",
+    "ios-text-input-caret-geometry"
   ],
   "publications": [
     {

@@ -1,0 +1,680 @@
+diff --git a/compose/ui/ui/samples/src/iosMain/kotlin/androidx/compose/ui/samples/UIKitTextInputMethodRequestSample.kt b/compose/ui/ui/samples/src/iosMain/kotlin/androidx/compose/ui/samples/UIKitTextInputMethodRequestSample.kt
+index 3e6adbcfca3..bf128dc51a5 100644
+--- a/compose/ui/ui/samples/src/iosMain/kotlin/androidx/compose/ui/samples/UIKitTextInputMethodRequestSample.kt
++++ b/compose/ui/ui/samples/src/iosMain/kotlin/androidx/compose/ui/samples/UIKitTextInputMethodRequestSample.kt
+@@ -18,9 +18,11 @@ package androidx.compose.ui.samples
+ 
+ import androidx.annotation.Sampled
+ import androidx.compose.ui.ExperimentalComposeUiApi
++import androidx.compose.ui.geometry.Rect
+ import androidx.compose.ui.platform.PlatformTextInputMethodRequest
+ import androidx.compose.ui.platform.PlatformTextInputSessionScope
+ import androidx.compose.ui.platform.UIKitTextInputMethodRequest
++import androidx.compose.ui.text.TextRange
+ import platform.UIKit.UIView
+ 
+ @Sampled
+@@ -29,9 +31,12 @@ suspend fun PlatformTextInputSessionScope.UIKitTextInputMethodRequestSample(
+     request: PlatformTextInputMethodRequest,
+     connect: (UIView) -> Unit,
+     disconnect: (UIView) -> Unit,
++    firstRectForRangeInRoot: ((TextRange) -> Rect?)? = null,
+ ) {
+     startInputMethod(
+         object : PlatformTextInputMethodRequest by request, UIKitTextInputMethodRequest {
++            override val firstRectForRangeInRoot: ((TextRange) -> Rect?)? = firstRectForRangeInRoot
++
+             override fun onTextInputViewAttached(view: UIView) {
+                 connect(view)
+             }
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputMethodRequest.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputMethodRequest.ios.kt
+index 3bf83d3d802..2eebb3dc67a 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputMethodRequest.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputMethodRequest.ios.kt
+@@ -17,6 +17,8 @@
+ package androidx.compose.ui.platform
+ 
+ import androidx.compose.ui.ExperimentalComposeUiApi
++import androidx.compose.ui.geometry.Rect
++import androidx.compose.ui.text.TextRange
+ import platform.UIKit.UIView
+ 
+ /**
+@@ -29,6 +31,15 @@ import platform.UIKit.UIView
+  */
+ @ExperimentalComposeUiApi
+ interface UIKitTextInputMethodRequest : PlatformTextInputMethodRequest {
++    /**
++     * Optional custom geometry for a UTF-16 range in [state], in root pixels. Returns the first
++     * visual line enclosing the range, or its caret if empty. A null result means this text has not
++     * been laid out; it must not be replaced with another position's geometry. When the callback
++     * itself is null, the focused rectangle is used for the current caret.
++     */
++    val firstRectForRangeInRoot: ((TextRange) -> Rect?)?
++        get() = null
++
+     /** Called after the input view is connected, before Compose requests keyboard presentation. */
+     fun onTextInputViewAttached(view: UIView)
+ 
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputService.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputService.ios.kt
+index e99423c8702..8addf506e56 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputService.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/platform/UIKitTextInputService.ios.kt
+@@ -79,10 +79,11 @@ internal class UIKitTextInputService(
+             }
+             launch {
+                 snapshotFlow {
+-                    Triple(
++                    listOf(
+                         request.textFieldRectInRoot(),
+                         request.textClippingRectInRoot(),
+                         request.unclippedTextOffsetInRoot(),
++                        request.focusedRectInRoot(),
+                     )
+                 }.collect {
+                     currentInputConnection?.onViewGeometryUpdated()
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
+index e066d024f02..5bb9ac65c33 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
+@@ -16,14 +16,18 @@
+ 
+ package androidx.compose.ui.text.input
+ 
++import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.geometry.Rect
+ import androidx.compose.ui.input.key.KeyEvent
+ import androidx.compose.ui.platform.TextToolbarStatus
+ import androidx.compose.ui.platform.UIKitNativeTextInputContextMenuCustomAction
++import androidx.compose.ui.platform.UIKitTextInputMethodRequest
+ import androidx.compose.ui.platform.ViewConfiguration
+ import androidx.compose.ui.scene.ComposeSceneFocusManager
++import androidx.compose.ui.text.TextRange
+ import androidx.compose.ui.uikit.density
+ import androidx.compose.ui.uikit.utils.CMPEditMenuCustomAction
++import androidx.compose.ui.unit.DpRect
+ import androidx.compose.ui.unit.toCGRect
+ import androidx.compose.ui.unit.toDpOffset
+ import androidx.compose.ui.unit.toDpRect
+@@ -57,10 +61,13 @@ internal open class ComposeTextInputConnection(
+ ) {
+     // Fixes a problem where the menu is shown before the textInputView gets its final layout.
+     private var showMenuOrUpdatePosition = {}
++    private var lastGeometry: Triple<Rect?, Rect?, Offset?>? = null
++    private var lastGeometryValue: TextFieldValue? = null
+ 
+     override val textInputView =
+         ComposeTextInputView(
+             doubleTapTimeoutMillis = viewConfiguration.doubleTapTimeoutMillis,
++            rectForRange = ::rectForRangeInView,
+         ).also {
+             it.setAutoresizingMask(
+                 UIViewAutoresizingFlexibleWidth or UIViewAutoresizingFlexibleHeight
+@@ -78,6 +85,8 @@ internal open class ComposeTextInputConnection(
+         val outOfBoundsFrame = CGRectMake(-100000.0, 0.0, 1.0, 1.0)
+ 
+         textInputView.input = null
++        lastGeometry = null
++        lastGeometryValue = null
+ 
+         showMenuOrUpdatePosition = {}
+         textInputView.let { view ->
+@@ -109,9 +118,60 @@ internal open class ComposeTextInputConnection(
+     }
+ 
+     override fun onViewGeometryUpdated() {
+-        val rect = textFieldRectInRoot ?: return
+-        textInputView.setFrame(rect.toDpRect(view.density).toCGRect())
+-        showMenuOrUpdatePosition()
++        val request = currentRequest ?: return
++        val value = request.stateSnapshot()
++        val field = textFieldRectInRoot
++        val geometry = Triple(field, request.textClippingRectInRoot(), unclippedTextOffsetInRoot)
++        // Text-origin movement is independent of IME edits. Other layout changes can be the
++        // delayed result of an edit, so keep suppressing their duplicate selection notifications.
++        val previous = lastGeometry
++        val notify =
++            previous != null &&
++                previous != geometry &&
++                (previous.third != geometry.third || lastGeometryValue == value)
++        // A caret-only snapshot must not consume the pending layout update's text baseline.
++        if (previous != geometry) {
++            lastGeometry = geometry
++            lastGeometryValue = value
++        }
++        if (notify) textInputView.selectionWillChange()
++        if (currentRequest !== request) return
++        if (field != null) textInputView.setFrame(field.toDpRect(view.density).toCGRect())
++        if (notify) textInputView.selectionDidChange()
++        if (currentRequest === request) showMenuOrUpdatePosition()
++    }
++
++    private fun rectForRangeInView(range: TextRange): DpRect? {
++        val request = currentRequest ?: return null
++        val value = currentTextFieldValue ?: return null
++        if (range.min < 0 || range.max > value.text.length) return null
++        // Geometry is synchronous: bring the host layout up to the text UIKit is querying.
++        // This also keeps pending selection affinity available at a soft-wrap boundary.
++        flushPendingTextInputEdits()
++        if (currentRequest !== request || request.stateSnapshot().text != value.text) return null
++        val customGeometry = (request as? UIKitTextInputMethodRequest)?.firstRectForRangeInRoot
++        val rect =
++            if (customGeometry != null) {
++                customGeometry(range)
++            } else {
++                focusedRectInRoot?.takeIf { range.collapsed && range.start == value.selection.end }
++            } ?: return null
++        // A custom editor may wait for its layout lock while another edit changes the text, or
++        // replace the input session reentrantly. Its result then belongs to a different query.
++        if (currentRequest !== request || request.stateSnapshot().text != value.text) return null
++        val clip = request.textClippingRectInRoot()
++        if (
++            clip != null &&
++                (rect.right < clip.left ||
++                    rect.left > clip.right ||
++                    rect.bottom <= clip.top ||
++                    rect.top >= clip.bottom)
++        )
++            return null
++        // Convert against the actual UIView frame, including queries before snapshot collection.
++        return view
++            .convertRect(rect.toDpRect(view.density).toCGRect(), toView = textInputView)
++            .toDpRect()
+     }
+ 
+     override fun setAvailableEditMenuActions(
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+index af782a7920f..49c8bb6493f 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/TextInputConnection.ios.kt
+@@ -71,7 +71,9 @@ internal abstract class TextInputConnection(
+     private var applyingEditGeneration: Long? = null
+ 
+     private var floatingCursorTranslation: Offset? = null
+-    private var currentRequest: PlatformTextInputMethodRequest? = null
++    protected var currentRequest: PlatformTextInputMethodRequest? = null
++        private set
++
+     // Only requests whose attachment callback has returned are ready for stop() to detach.
+     private var attachedRequest: UIKitTextInputMethodRequest? = null
+     private val pendingEditCommands = mutableListOf<EditCommand>()
+@@ -92,6 +94,9 @@ internal abstract class TextInputConnection(
+     protected val textFieldRectInRoot
+         get() = currentRequest?.textFieldRectInRoot()
+ 
++    protected val focusedRectInRoot
++        get() = currentRequest?.focusedRectInRoot()
++
+     fun start(request: PlatformTextInputMethodRequest) {
+         val previousRequest = attachedRequest
+         attachedRequest = null
+diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt
+index 64375e16be9..f3ecc566b03 100644
+--- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt
++++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/window/ComposeTextInputView.ios.kt
+@@ -17,18 +17,20 @@
+ package androidx.compose.ui.window
+ 
+ import androidx.compose.ui.platform.EmptyInputTraits
++import androidx.compose.ui.platform.SkikoUITextInputTraits
++import androidx.compose.ui.platform.TextEditingDelegate
+ import androidx.compose.ui.platform.TextInputPosition
+ import androidx.compose.ui.platform.TextInputRange
+ import androidx.compose.ui.platform.TextInputStringTokenizer
+-import androidx.compose.ui.platform.SkikoUITextInputTraits
+-import androidx.compose.ui.platform.TextEditingDelegate
+ import androidx.compose.ui.platform.selectTextNearCursor
+ import androidx.compose.ui.platform.toTextRange
+ import androidx.compose.ui.platform.toUITextRange
+ import androidx.compose.ui.text.TextRange
+ import androidx.compose.ui.uikit.utils.CMPEditMenuView
+ import androidx.compose.ui.unit.DpOffset
++import androidx.compose.ui.unit.DpRect
+ import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.toCGRect
+ import kotlin.time.Duration.Companion.milliseconds
+ import kotlin.time.DurationUnit
+ import kotlinx.cinterop.CValue
+@@ -37,7 +39,6 @@ import kotlinx.cinterop.readValue
+ import kotlinx.cinterop.useContents
+ import platform.CoreGraphics.CGPoint
+ import platform.CoreGraphics.CGRect
+-import platform.CoreGraphics.CGRectMake
+ import platform.CoreGraphics.CGRectNull
+ import platform.CoreGraphics.CGRectZero
+ import platform.Foundation.NSComparisonResult
+@@ -77,6 +78,7 @@ import platform.darwin.NSInteger
+  */
+ internal class ComposeTextInputView(
+     private val doubleTapTimeoutMillis: Long,
++    private val rectForRange: (TextRange) -> DpRect? = { null },
+ ) : CMPEditMenuView(frame = CGRectZero.readValue()),
+     UIKeyInputProtocol, UITextInputProtocol {
+     private var _inputDelegate: UITextInputDelegateProtocol? = null
+@@ -404,11 +406,15 @@ internal class ComposeTextInputView(
+         forRange: UITextRange
+     ) {}
+ 
+-    override fun firstRectForRange(range: UITextRange): CValue<CGRect> =
+-        CGRectNull.readValue()
++    override fun firstRectForRange(range: UITextRange): CValue<CGRect> {
++        val textRange = range.toTextRange() ?: return CGRectNull.readValue()
++        return rectForRange(textRange)?.toCGRect() ?: CGRectNull.readValue()
++    }
+ 
+-    override fun caretRectForPosition(position: UITextPosition): CValue<CGRect> =
+-        CGRectMake(x = 1.0, y = 1.0, width = 0.0, height = 1.0)
++    override fun caretRectForPosition(position: UITextPosition): CValue<CGRect> {
++        val offset = (position as? TextInputPosition)?.position ?: return CGRectNull.readValue()
++        return rectForRange(TextRange(offset))?.toCGRect() ?: CGRectNull.readValue()
++    }
+ 
+     override fun selectionRectsForRange(range: UITextRange): List<*> =
+         listOf<UITextSelectionRect>()
+diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
+index d55160e8c5e..8e7c162a75a 100644
+--- a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
++++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
+@@ -16,6 +16,10 @@
+ 
+ package androidx.compose.ui.text.input
+ 
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.snapshots.Snapshot
+ import androidx.compose.ui.InternalComposeUiApi
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.focus.FocusRequester
+@@ -28,12 +32,21 @@ import androidx.compose.ui.input.key.KeyEvent
+ import androidx.compose.ui.input.key.KeyEventType
+ import androidx.compose.ui.layout.Layout
+ import androidx.compose.ui.platform.FrameRecomposer
++import androidx.compose.ui.platform.PlatformContext
+ import androidx.compose.ui.platform.PlatformTextInputMethodRequest
++import androidx.compose.ui.platform.TextInputPosition
+ import androidx.compose.ui.platform.UIKitTextInputMethodRequest
++import androidx.compose.ui.platform.UIKitTextInputService
++import androidx.compose.ui.platform.toTextRange
++import androidx.compose.ui.platform.toUITextRange
+ import androidx.compose.ui.scene.CanvasLayersComposeScene
+ import androidx.compose.ui.scene.ComposeSceneFocusManager
+ import androidx.compose.ui.text.TextLayoutResult
+ import androidx.compose.ui.text.TextRange
++import androidx.compose.ui.uikit.density
++import androidx.compose.ui.unit.DpRect
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.toDpRect
+ import androidx.compose.ui.window.ComposeTextInputView
+ import kotlin.test.Test
+ import kotlin.test.assertEquals
+@@ -43,14 +56,348 @@ import kotlinx.cinterop.ExperimentalForeignApi
+ import kotlinx.cinterop.readValue
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.cancelAndJoin
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.test.runCurrent
+ import kotlinx.coroutines.test.runTest
++import platform.CoreGraphics.CGRectIsNull
++import platform.CoreGraphics.CGRectMake
+ import platform.CoreGraphics.CGRectZero
++import platform.Foundation.NSMakeRange
++import platform.UIKit.UIConversationContext
++import platform.UIKit.UITextInputDelegateProtocol
++import platform.UIKit.UITextInputProtocol
+ import platform.UIKit.UIView
++import platform.darwin.NSObject
+ 
+ @OptIn(ExperimentalForeignApi::class, ExperimentalCoroutinesApi::class, InternalComposeUiApi::class)
+ class TextInputConnectionIosTest {
++    @Test
++    fun scrollingNotifiesUIKitWithoutRepeatingNativeSelectionChanges() = runTest {
++        val host = UIView(frame = CGRectMake(0.0, 0.0, 400.0, 600.0))
++        val scale = host.density.density
++        var focused by
++            mutableStateOf<Rect?>(Rect(140f * scale, 120f * scale, 140f * scale, 148f * scale))
++        var origin by mutableStateOf(Offset(20f * scale, 30f * scale))
++        var field by mutableStateOf(Rect(20f * scale, 30f * scale, 320f * scale, 430f * scale))
++        val value = TextFieldValue("にほんご", TextRange(4), TextRange(0, 4))
++        val delegate = TestRequest(value)
++        val notifications = mutableListOf<String>()
++        val inputDelegate =
++            object : NSObject(), UITextInputDelegateProtocol {
++                override fun conversationContext(
++                    context: UIConversationContext?,
++                    didChange: UITextInputProtocol?,
++                ) = Unit
++
++                override fun selectionWillChange(textInput: UITextInputProtocol?) {
++                    notifications += "will"
++                }
++
++                override fun selectionDidChange(textInput: UITextInputProtocol?) {
++                    notifications += "did"
++                }
++
++                override fun textWillChange(textInput: UITextInputProtocol?) {
++                    notifications += "text-will"
++                }
++
++                override fun textDidChange(textInput: UITextInputProtocol?) {
++                    notifications += "text-did"
++                }
++            }
++        lateinit var inputView: ComposeTextInputView
++        val request =
++            object : PlatformTextInputMethodRequest by delegate, UIKitTextInputMethodRequest {
++                override val unclippedTextOffsetInRoot: () -> Offset? = { origin }
++                override val focusedRectInRoot: () -> Rect? = { focused }
++                override val textFieldRectInRoot: () -> Rect? = { field }
++                override val textClippingRectInRoot: () -> Rect? = { field }
++
++                override fun onTextInputViewAttached(view: UIView) {
++                    inputView = view as ComposeTextInputView
++                    inputView.setInputDelegate(inputDelegate)
++                }
++
++                override fun onTextInputViewDetached(view: UIView) = Unit
++            }
++        val service =
++            UIKitTextInputService(
++                updateView = {},
++                view = host,
++                viewConfiguration = PlatformContext.DefaultViewConfiguration,
++                focusedViewsList = null,
++                onInputStarted = {},
++                focusManager = { null },
++                onHardwareKeyRepeat = {},
++                coroutineContext = backgroundScope.coroutineContext,
++            )
++        val session = backgroundScope.launch { service.startInputMethod(request) }
++        runCurrent()
++        notifications.clear()
++        origin += Offset(0f, -40f * scale)
++        focused = focused?.translate(Offset(0f, -40f * scale))
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals(listOf("will", "did"), notifications)
++        assertEquals(value, request.value())
++        assertEquals(emptyList(), delegate.dispatchedCommands)
++
++        // Equal-width marked-text replacement does not invalidate the geometry snapshot. The
++        // very next scroll must still notify UIKit, even when it is a single discrete movement.
++        notifications.clear()
++        inputView.setMarkedText("かんこく", NSMakeRange(4u, 0u))
++        runCurrent()
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals(emptyList(), notifications)
++        origin += Offset(0f, -10f * scale)
++        focused = focused?.translate(Offset(0f, -10f * scale))
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals(listOf("will", "did"), notifications)
++
++        // Moving within the marked text is owned by UIKit; don't echo another selection change
++        // when the renderer publishes the resulting caret on the next frame.
++        notifications.clear()
++        inputView.setSelectedTextRange(TextRange(2).toUITextRange())
++        runCurrent()
++        assertEquals(
++            value.copy(text = "かんこく", selection = TextRange(2)),
++            request.value(),
++            "native host state",
++        )
++        assertEquals(
++            TextRange(0, 4),
++            inputView.markedTextRange()?.toTextRange(),
++            "native marked range",
++        )
++        focused = focused?.translate(Offset(-40f * scale, 0f))
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals(emptyList(), notifications)
++        // Layout can resize the field in a later frame than the renderer's caret update.
++        field = field.copy(bottom = field.bottom + 20f * scale)
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals(emptyList(), notifications)
++        assertEquals(TextRange(0, 4), inputView.markedTextRange()?.toTextRange())
++
++        origin += Offset(0f, -200f * scale)
++        focused = focused?.translate(Offset(0f, -200f * scale))
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals(listOf("will", "did"), notifications)
++        assertTrue(CGRectIsNull(inputView.caretRectForPosition(TextInputPosition(2))))
++        session.cancelAndJoin()
++    }
++
++    @Test
++    fun rangeGeometryIsDiscardedWhenTheCallbackChangesTextOrSession() = runTest {
++        val host = UIView(frame = CGRectMake(0.0, 0.0, 400.0, 600.0))
++        val connection =
++            ComposeTextInputConnection(
++                updateView = {},
++                view = host,
++                coroutineScope = backgroundScope,
++                viewConfiguration = PlatformContext.DefaultViewConfiguration,
++                focusedViewsList = null,
++                focusManager = { null },
++            )
++        val value = TextFieldValue("にほんご", TextRange(4), TextRange(0, 4))
++        lateinit var inputView: ComposeTextInputView
++        for (replaceSession in listOf(false, true)) {
++            val delegate = TestRequest(value)
++            val request =
++                object : PlatformTextInputMethodRequest by delegate, UIKitTextInputMethodRequest {
++                    override val textFieldRectInRoot: () -> Rect? = { Rect(0f, 0f, 400f, 600f) }
++                    override val firstRectForRangeInRoot: (TextRange) -> Rect? = {
++                        if (replaceSession) connection.start(TestRequest(value))
++                        else delegate.editText { setComposingText("かんこく", 1) }
++                        Rect(20f, 30f, 100f, 60f)
++                    }
++
++                    override fun onTextInputViewAttached(view: UIView) {
++                        inputView = view as ComposeTextInputView
++                    }
++
++                    override fun onTextInputViewDetached(view: UIView) = Unit
++                }
++            connection.start(request)
++            assertTrue(
++                CGRectIsNull(inputView.firstRectForRange(TextRange(0, 4).toUITextRange())),
++                "discard callback result after ${if (replaceSession) "session replacement" else "text change"}",
++            )
++            connection.stop()
++        }
++    }
++
++    @Test
++    fun requestedRangeGeometryDoesNotFollowTheComposingCaret() = runTest {
++        val host = UIView(frame = CGRectMake(0.0, 0.0, 400.0, 600.0))
++        val scale = host.density.density
++        val value = TextFieldValue("にほんご", TextRange(4), TextRange(0, 4))
++        val delegate = TestRequest(value)
++        var scrollY = 0f
++        var geometryAvailable = true
++        val field = Rect(20f * scale, 30f * scale, 320f * scale, 430f * scale)
++        lateinit var inputView: ComposeTextInputView
++        val request =
++            object : PlatformTextInputMethodRequest by delegate, UIKitTextInputMethodRequest {
++                override val focusedRectInRoot: () -> Rect? = {
++                    Rect(140f * scale, 120f * scale, 140f * scale, 148f * scale)
++                }
++                override val textFieldRectInRoot: () -> Rect? = { field }
++                override val firstRectForRangeInRoot: (TextRange) -> Rect? = { range ->
++                    if (!geometryAvailable) null
++                    else
++                        Rect(
++                            (60f + 20f * range.min) * scale,
++                            (120f - scrollY) * scale,
++                            (60f + 20f * range.max) * scale,
++                            (148f - scrollY) * scale,
++                        )
++                }
++
++                override fun onTextInputViewAttached(view: UIView) {
++                    inputView = view as ComposeTextInputView
++                }
++
++                override fun onTextInputViewDetached(view: UIView) = Unit
++            }
++        val service =
++            UIKitTextInputService(
++                updateView = {},
++                view = host,
++                viewConfiguration = PlatformContext.DefaultViewConfiguration,
++                focusedViewsList = null,
++                onInputStarted = {},
++                focusManager = { null },
++                onHardwareKeyRepeat = {},
++                coroutineContext = backgroundScope.coroutineContext,
++            )
++        val session = backgroundScope.launch { service.startInputMethod(request) }
++        runCurrent()
++        assertEquals(
++            DpRect(40.dp, 90.dp, 120.dp, 118.dp),
++            inputView.firstRectForRange(TextRange(0, 4).toUITextRange()).toDpRect(),
++        )
++        assertEquals(
++            DpRect(60.dp, 90.dp, 100.dp, 118.dp),
++            inputView.firstRectForRange(TextRange(1, 3).toUITextRange()).toDpRect(),
++        )
++        for (position in listOf(4, 2, 3, 0)) {
++            assertEquals(
++                DpRect((40 + 20 * position).dp, 90.dp, (40 + 20 * position).dp, 118.dp),
++                inputView.caretRectForPosition(TextInputPosition(position)).toDpRect(),
++            )
++        }
++        // A UIKit query must read current geometry even before the next snapshot collector runs.
++        scrollY = 40f
++        assertEquals(
++            DpRect(40.dp, 50.dp, 120.dp, 78.dp),
++            inputView.firstRectForRange(TextRange(0, 4).toUITextRange()).toDpRect(),
++        )
++        assertTrue(CGRectIsNull(inputView.firstRectForRange(TextRange(0, 5).toUITextRange())))
++        geometryAvailable = false
++        assertTrue(CGRectIsNull(inputView.caretRectForPosition(TextInputPosition(4))))
++        assertTrue(CGRectIsNull(inputView.firstRectForRange(TextRange(0, 4).toUITextRange())))
++        assertEquals(value, request.value())
++        assertEquals(emptyList(), delegate.dispatchedCommands)
++
++        // UIKit can request the candidate anchor before the native edit batch has yielded.
++        geometryAvailable = true
++        inputView.setMarkedText("にほんごです", NSMakeRange(6u, 0u))
++        assertEquals(value, request.value(), "edit is still pending")
++        assertEquals(
++            DpRect(40.dp, 50.dp, 160.dp, 78.dp),
++            inputView.firstRectForRange(TextRange(0, 6).toUITextRange()).toDpRect(),
++        )
++        assertEquals("にほんごです", request.value().text)
++        assertEquals(TextRange(0, 6), inputView.markedTextRange()?.toTextRange())
++        inputView.setSelectedTextRange(TextRange(2).toUITextRange())
++        assertEquals(
++            DpRect(80.dp, 50.dp, 80.dp, 78.dp),
++            inputView.caretRectForPosition(TextInputPosition(2)).toDpRect(),
++        )
++        assertEquals(TextRange(2), request.value().selection)
++        val dispatchedCount = delegate.dispatchedCommands.size
++        runCurrent()
++        assertEquals(dispatchedCount, delegate.dispatchedCommands.size, "no duplicate batch")
++        assertEquals(TextRange(0, 6), inputView.markedTextRange()?.toTextRange())
++        session.cancelAndJoin()
++    }
++
++    @Test
++    fun caretGeometryTracksTheFocusedRectWithoutChangingComposition() = runTest {
++        val hostView = UIView(frame = CGRectMake(0.0, 0.0, 400.0, 600.0))
++        val scale = hostView.density.density
++        var fieldRect by mutableStateOf(Rect(20f * scale, 30f * scale, 320f * scale, 430f * scale))
++        var focusedRect by
++            mutableStateOf<Rect?>(Rect(60f * scale, 120f * scale, 61f * scale, 148f * scale))
++        val initialValue = TextFieldValue("にほん", TextRange(3), TextRange(0, 3))
++        val delegate = TestRequest(initialValue)
++        lateinit var inputView: ComposeTextInputView
++        var caretAtAttachment: DpRect? = null
++        val request =
++            object : PlatformTextInputMethodRequest by delegate, UIKitTextInputMethodRequest {
++                override val focusedRectInRoot: () -> Rect? = { focusedRect }
++                override val textFieldRectInRoot: () -> Rect? = { fieldRect }
++
++                override fun onTextInputViewAttached(view: UIView) {
++                    inputView = view as ComposeTextInputView
++                    // UIKit can ask for the caret before keyboard presentation starts.
++                    caretAtAttachment =
++                        inputView.caretRectForPosition(TextInputPosition(3)).toDpRect()
++                }
++
++                override fun onTextInputViewDetached(view: UIView) = Unit
++            }
++        val service =
++            UIKitTextInputService(
++                updateView = {},
++                view = hostView,
++                viewConfiguration = PlatformContext.DefaultViewConfiguration,
++                focusedViewsList = null,
++                onInputStarted = {},
++                focusManager = { null },
++                onHardwareKeyRepeat = {},
++                coroutineContext = backgroundScope.coroutineContext,
++            )
++        val inputSession = backgroundScope.launch { service.startInputMethod(request) }
++        runCurrent()
++        assertEquals(DpRect(40.dp, 90.dp, 41.dp, 118.dp), caretAtAttachment)
++        assertEquals(DpRect(20.dp, 30.dp, 320.dp, 430.dp), inputView.frame.toDpRect())
++
++        // The field and text stay still; caret-only updates must reach UIKit.
++        focusedRect = Rect(84f * scale, 156f * scale, 84f * scale, 192f * scale)
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals(
++            DpRect(64.dp, 126.dp, 64.dp, 162.dp),
++            inputView.caretRectForPosition(TextInputPosition(3)).toDpRect(),
++        )
++
++        // Root coordinates must be translated against the latest field origin.
++        fieldRect = Rect(28f * scale, 42f * scale, 328f * scale, 442f * scale)
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals(
++            DpRect(56.dp, 114.dp, 56.dp, 150.dp),
++            inputView.caretRectForPosition(TextInputPosition(3)).toDpRect(),
++        )
++        assertEquals(TextRange(0, 3), inputView.markedTextRange()?.toTextRange())
++        assertEquals(initialValue, request.value())
++        assertEquals(emptyList(), delegate.dispatchedCommands)
++
++        // Missing geometry must not keep the last session's caret.
++        focusedRect = null
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertTrue(CGRectIsNull(inputView.caretRectForPosition(TextInputPosition(3))))
++        inputSession.cancelAndJoin()
++    }
++
+     @Test
+     fun inputViewLifecycleEnclosesKeyboardPresentationAndDoesNotOutliveConnection() = runTest {
+         val events = mutableListOf<String>()
+@@ -779,7 +1126,19 @@ private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMetho
+         TestTextEditingScope(commands).block()
+         dispatchedCommands += commands
+         fieldValue =
+-            resultOverride ?: EditProcessor().also { it.reset(fieldValue, null) }.apply(commands)
++            resultOverride
++                ?: EditProcessor()
++                    .also { processor ->
++                        processor.reset(fieldValue, null)
++                        // reset() treats the initial text as an external replacement and clears
++                        // composition.
++                        // The host is applying an IME edit to its existing marked text, so restore
++                        // that state.
++                        fieldValue.composition?.let {
++                            processor.apply(listOf(SetComposingRegionCommand(it.start, it.end)))
++                        }
++                    }
++                    .apply(commands)
+         afterEdit()
+     }
+ }

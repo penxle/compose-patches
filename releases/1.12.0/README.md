@@ -30,11 +30,17 @@ Apply these after the August baseline, in order:
    detachment callbacks, including cancellation and reentrant request replacement.
    Typie uses these callbacks to install its bridges without first-responder
    traversal or delayed retries.
+4. `ios-text-input-caret-geometry`: deliver actual caret and text-range rectangles
+   to the Compose-rendered UIKit input view and notify UIKit about scrolling.
+   Typie supplies range geometry from its Rust layout and removes its field-frame workaround.
 
 The first follow-up can be applied without the second. The second patch is based
 on the first, including its input-test fixture. The lifecycle patch is
-based on both and can be removed independently, together with Typie's request
-wrapper that consumes its API.
+based on both. Remove caret geometry before removing lifecycle support and
+Typie's request wrapper that consumes its API.
+
+The caret-geometry patch can be removed independently, together with reverting
+Typie's range callback and restoring its field-frame workaround.
 
 The consolidation of the first two follow-ups produced exactly the same source
 files and tests as the previous seven-patch release plus the reviewed,
@@ -44,9 +50,9 @@ published patch revisions remain in Git history; they are not rewritten.
 
 ## Source rollback
 
-To restore the August source baseline, remove all three September follow-up IDs from
+To restore the August source baseline, remove all four September follow-up IDs from
 `release.json`, leaving the first four IDs unchanged. When reversing patches in
-an already-patched checkout, reverse lifecycle handling first, then hardware handling,
+an already-patched checkout, reverse caret geometry first, then lifecycle and hardware handling,
 then IME synchronization.
 After removing lifecycle handling, hardware handling can also be removed while
 leaving the IME fixes available.
