@@ -18,6 +18,9 @@ supply the composing range or the caret's actual height to the Japanese IME.
   through the actual input view frame into local UIKit points.
 - A missing callback retains focused-caret support. A callback that returns no geometry does not
   fall back to a different or stale caret. Rectangles outside the clipping region are unavailable.
+- Limit additional geometry selection notifications to explicit `UIKitTextInputMethodRequest` integrations.
+  Regular Compose text fields still update their frame, but placeholder and first-glyph relayout do not
+  send extra selection changes that interrupt the Korean keyboard's input context.
 - Notify UIKit when the unclipped text origin moves, even after a text edit with unchanged geometry.
   A custom editor supplies `unclippedTextOffsetInRoot` to expose scrolling independently of the caret.
   Keep suppressing other layout changes caused by IME edits, including delayed field resizing,
@@ -48,7 +51,8 @@ field-origin changes, zero-width carets, unavailable or clipped geometry, a sing
 equal-width marked-text replacement, delayed native caret/field updates, callback-time text or
 session replacement,
 queries made before pending edits are flushed or rendered frames are published, and preservation
-of Japanese marked text without duplicate edit dispatch. The initial range test returned `CGRectNull`; the
+of Japanese marked text without duplicate edit dispatch. A regular-field regression covers a first Korean
+consonant followed by baseline and width changes across separate layout passes without selection notifications. The initial range test returned `CGRectNull`; the
 initial scroll test received no UIKit geometry notifications.
 
 Physical-device candidate alignment and scroll behavior require separate confirmation; these
