@@ -1,0 +1,272 @@
+diff --git a/compose/foundation/foundation/src/commonMain/kotlin/androidx/compose/foundation/text/input/internal/selection/TextFieldSelectionState.kt b/compose/foundation/foundation/src/commonMain/kotlin/androidx/compose/foundation/text/input/internal/selection/TextFieldSelectionState.kt
+index a17eca74b0b..fcff5485f21 100644
+--- a/compose/foundation/foundation/src/commonMain/kotlin/androidx/compose/foundation/text/input/internal/selection/TextFieldSelectionState.kt
++++ b/compose/foundation/foundation/src/commonMain/kotlin/androidx/compose/foundation/text/input/internal/selection/TextFieldSelectionState.kt
+@@ -145,7 +145,7 @@ internal class TextFieldSelectionState(
+     private var clipboard: Clipboard,
+ ) {
+     // This field is updated from `TextFieldCoreModifier`.
+-    var isWindowAndTextFieldFocused: Boolean = false
++    var isWindowAndTextFieldFocused: Boolean by mutableStateOf(false)
+ 
+     var enabled: Boolean = enabled
+         private set
+diff --git a/compose/foundation/foundation/src/iosMain/kotlin/androidx/compose/foundation/text/ContextMenu.ios.kt b/compose/foundation/foundation/src/iosMain/kotlin/androidx/compose/foundation/text/ContextMenu.ios.kt
+index 92e1ecd7436..de3d49660ef 100644
+--- a/compose/foundation/foundation/src/iosMain/kotlin/androidx/compose/foundation/text/ContextMenu.ios.kt
++++ b/compose/foundation/foundation/src/iosMain/kotlin/androidx/compose/foundation/text/ContextMenu.ios.kt
+@@ -497,10 +497,13 @@ private fun notifyAboutContextMenuItems(
+ @Composable
+ private fun startObservingSelectionChanges(
+     context: UIKitNativeTextInputContext,
++    isFocused: () -> Boolean,
+     itemsStateProvider: () -> ContextMenuItemsState,
+ ) {
+     LaunchedEffect(itemsStateProvider) {
+-        snapshotFlow { itemsStateProvider() }.collect {
++        // The context is shared by every field in the scene. Only the focused field
++        // may install actions on its current UIKit input connection.
++        snapshotFlow { if (isFocused()) itemsStateProvider() else null }.filterNotNull().collect {
+             context.updateNativeTextInputEditMenuState(
+                 copy = it.copy,
+                 paste = it.paste,
+@@ -531,13 +534,17 @@ private fun startNotifyingAboutContextMenuItems(
+     val scope = rememberCoroutineScope()
+     startObservingSelectionChanges(
+         nativeTextInputContext,
++        isFocused = { manager.state?.hasFocus == true },
+         itemsStateProvider = {
+             fun editBlock(isEnabled: Boolean, action: () -> Unit): (() -> Unit)? {
+                 return if (isEnabled) {
+                     {
+-                        action()
+-                        scope.launch {
+-                            manager.updateClipboardEntry()
++                        // Focus can move before UIKit replaces an installed action.
++                        if (manager.state?.hasFocus == true) {
++                            action()
++                            scope.launch {
++                                manager.updateClipboardEntry()
++                            }
+                         }
+                     }
+                 } else {
+@@ -576,13 +583,16 @@ private fun startNotifyingAboutContextMenuItems(
+     val coroutineScope = rememberCoroutineScope()
+     startObservingSelectionChanges(
+         nativeTextInputContext,
++        isFocused = { state.isWindowAndTextFieldFocused },
+         itemsStateProvider = {
+             fun editBlock(isEnabled: Boolean, action: suspend () -> Unit): (() -> Unit)? {
+                 return if (isEnabled) {
+                     {
+                         coroutineScope.launch {
+-                            action()
+-                            state.updateClipboardEntry()
++                            if (state.isWindowAndTextFieldFocused) {
++                                action()
++                                state.updateClipboardEntry()
++                            }
+                         }
+                     }
+                 } else {
+diff --git a/compose/foundation/foundation/src/iosTest/kotlin/androidx/compose/foundation/text/TextInputContextMenuFocusTest.kt b/compose/foundation/foundation/src/iosTest/kotlin/androidx/compose/foundation/text/TextInputContextMenuFocusTest.kt
+new file mode 100644
+index 00000000000..1eab201d6a7
+--- /dev/null
++++ b/compose/foundation/foundation/src/iosTest/kotlin/androidx/compose/foundation/text/TextInputContextMenuFocusTest.kt
+@@ -0,0 +1,194 @@
++/*
++ * Copyright 2025 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package androidx.compose.foundation.text
++
++import androidx.compose.foundation.focusable
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.text.input.TextFieldState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.ExperimentalComposeUiApi
++import androidx.compose.ui.InternalComposeUiApi
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.ClipEntry
++import androidx.compose.ui.platform.Clipboard
++import androidx.compose.ui.platform.LocalClipboard
++import androidx.compose.ui.platform.NativeClipboard
++import androidx.compose.ui.platform.UIKitNativeTextInputContext
++import androidx.compose.ui.platform.UIKitNativeTextInputContextMenuCustomAction
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.text.input.TextFieldValue
++import androidx.compose.ui.uikit.LocalNativeTextInputContext
++import androidx.compose.ui.unit.dp
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import platform.UIKit.UIPasteboard
++
++@OptIn(ExperimentalTestApi::class, ExperimentalComposeUiApi::class, InternalComposeUiApi::class)
++class TextInputContextMenuFocusTest {
++    @Test
++    fun unfocusedFieldsCannotHandleSystemPaste() {
++        for (stateBased in listOf(false, true)) {
++            runComposeUiTest {
++                val context = TestTextInputContext()
++                val title = TestField(stateBased)
++                val subtitle = TestField(stateBased)
++                val body = FocusRequester()
++                setContent {
++                    CompositionLocalProvider(
++                        LocalNativeTextInputContext provides context,
++                        LocalClipboard provides TestClipboard,
++                    ) {
++                        Column {
++                            title.Content()
++                            subtitle.Content()
++                            Box(Modifier.size(40.dp).focusRequester(body).focusable())
++                        }
++                    }
++                }
++                runOnIdle { body.requestFocus() }
++                runOnIdle { context.paste?.invoke() }
++                runOnIdle {
++                    assertEquals("", title.text)
++                    assertEquals(
++                        "",
++                        subtitle.text,
++                        "An unfocused field must not receive system paste",
++                    )
++                }
++            }
++        }
++    }
++
++    @Test
++    fun systemPasteFollowsFocusBetweenFields() {
++        for (stateBased in listOf(false, true)) {
++            runComposeUiTest {
++                val context = TestTextInputContext()
++                val title = TestField(stateBased)
++                val subtitle = TestField(stateBased)
++                setContent {
++                    CompositionLocalProvider(
++                        LocalNativeTextInputContext provides context,
++                        LocalClipboard provides TestClipboard,
++                    ) {
++                        Column {
++                            title.Content()
++                            subtitle.Content()
++                        }
++                    }
++                }
++                runOnIdle { title.focusRequester.requestFocus() }
++                runOnIdle { assertNotNull(context.paste).invoke() }
++                runOnIdle {
++                    assertEquals("pasted", title.text)
++                    assertEquals("", subtitle.text)
++                    subtitle.focusRequester.requestFocus()
++                }
++                runOnIdle { assertNotNull(context.paste).invoke() }
++                runOnIdle {
++                    assertEquals("pasted", title.text)
++                    assertEquals("pasted", subtitle.text)
++                }
++            }
++        }
++    }
++
++    @Test
++    fun previousPasteCallbackCannotMutateFieldAfterFocusMoves() {
++        for (stateBased in listOf(false, true)) {
++            runComposeUiTest {
++                val context = TestTextInputContext()
++                val field = TestField(stateBased)
++                val body = FocusRequester()
++                setContent {
++                    CompositionLocalProvider(
++                        LocalNativeTextInputContext provides context,
++                        LocalClipboard provides TestClipboard,
++                    ) {
++                        Column {
++                            field.Content()
++                            Box(Modifier.size(40.dp).focusRequester(body).focusable())
++                        }
++                    }
++                }
++                runOnIdle { field.focusRequester.requestFocus() }
++                runOnIdle {
++                    val previousPaste = assertNotNull(context.paste)
++                    body.requestFocus()
++                    // UIKit can invoke an already installed action before recomposition.
++                    previousPaste()
++                }
++                runOnIdle { assertEquals("", field.text) }
++            }
++        }
++    }
++
++    private class TestField(private val stateBased: Boolean) {
++        val focusRequester = FocusRequester()
++        private var value by mutableStateOf(TextFieldValue())
++        private val state = TextFieldState()
++        val text: String
++            get() = if (stateBased) state.text.toString() else value.text
++
++        @Composable
++        fun Content() {
++            if (stateBased) {
++                BasicTextField(state, Modifier.focusRequester(focusRequester))
++            } else {
++                BasicTextField(value, { value = it }, Modifier.focusRequester(focusRequester))
++            }
++        }
++    }
++
++    private object TestClipboard : Clipboard {
++        override val nativeClipboard: NativeClipboard =
++            UIPasteboard.pasteboardWithUniqueName().apply { string = "pasted" }
++
++        override suspend fun getClipEntry(): ClipEntry = ClipEntry.withPlainText("pasted")
++
++        override suspend fun setClipEntry(clipEntry: ClipEntry?) = Unit
++    }
++
++    private class TestTextInputContext : UIKitNativeTextInputContext {
++        var paste: (() -> Unit)? = null
++
++        override fun usingNativeTextInput(): Boolean = false
++
++        override fun updateNativeTextInputTintColor(color: Color?) = Unit
++
++        override fun updateNativeTextInputEditMenuState(
++            copy: (() -> Unit)?,
++            paste: (() -> Unit)?,
++            cut: (() -> Unit)?,
++            selectAll: (() -> Unit)?,
++            customActions: List<UIKitNativeTextInputContextMenuCustomAction>?,
++        ) {
++            this.paste = paste
++        }
++    }
++}

@@ -12,7 +12,8 @@
     "ios-hardware-keyboard-native-repeat",
     "ios-text-input-view-lifecycle",
     "ios-text-input-caret-geometry",
-    "flush-coroutine-dispatcher-reentrancy"
+    "flush-coroutine-dispatcher-reentrancy",
+    "ios-text-input-context-menu-focus"
   ],
   "publications": [
     {
@@ -24,6 +25,16 @@
       "group": "org.jetbrains.compose.ui",
       "artifact": "ui-iossimulatorarm64",
       "task": ":compose:ui:ui:publishIosSimulatorArm64PublicationToGitHubPackagesRepository"
+    },
+    {
+      "group": "org.jetbrains.compose.foundation",
+      "artifact": "foundation-iosarm64",
+      "task": ":compose:foundation:foundation:publishIosArm64PublicationToGitHubPackagesRepository"
+    },
+    {
+      "group": "org.jetbrains.compose.foundation",
+      "artifact": "foundation-iossimulatorarm64",
+      "task": ":compose:foundation:foundation:publishIosSimulatorArm64PublicationToGitHubPackagesRepository"
     }
   ]
 }

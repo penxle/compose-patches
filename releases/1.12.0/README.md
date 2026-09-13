@@ -36,6 +36,10 @@ Apply these after the August baseline, in order:
 5. `flush-coroutine-dispatcher-reentrancy`: remove queued tasks before executing
    them and preserve the outer running state across nested flushes. This prevents
    synchronous frame requests from executing a completed coroutine again.
+6. `ios-text-input-context-menu-focus`: let only the focused text field register
+   system editing actions, and reject callbacks after focus leaves that field.
+   This prevents a custom editor's system paste action from modifying an unfocused
+   title or subtitle. Both `TextFieldValue` and `TextFieldState` fields are covered.
 
 The first follow-up can be applied without the second. The second patch is based
 on the first, including its input-test fixture. The lifecycle patch is
@@ -48,6 +52,12 @@ Typie's range callback and restoring its field-frame workaround.
 The dispatcher patch is independent of the input patches and can be removed separately.
 It changes shared iOS/Desktop source; this release publishes only iOS artifacts.
 
+The context-menu focus patch is independent of the UI patches. It also publishes
+`foundation-iosarm64` and `foundation-iossimulatorarm64`; consumers must resolve
+these artifacts from the patch repository alongside the patched UI artifacts.
+The change applies to the default iOS context-menu implementation
+(`isNewContextMenuEnabled = false`).
+
 The consolidation of the first two follow-ups produced exactly the same source
 files and tests as the previous seven-patch release plus the reviewed,
 uncommitted reentrant-flush patch.
@@ -56,10 +66,11 @@ published patch revisions remain in Git history; they are not rewritten.
 
 ## Source rollback
 
-To restore the August source baseline, remove all five September follow-up IDs from
+To restore the August source baseline, remove all six September follow-up IDs from
 `release.json`, leaving the first four IDs unchanged. When reversing patches in
-an already-patched checkout, reverse the dispatcher patch and caret geometry first, then lifecycle and hardware handling,
-then IME synchronization.
+an already-patched checkout, reverse context-menu focus, dispatcher reentrancy,
+and caret geometry first, then lifecycle and hardware handling, then IME
+synchronization.
 After removing lifecycle handling, hardware handling can also be removed while
 leaving the IME fixes available.
 
