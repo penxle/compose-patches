@@ -11,7 +11,8 @@
     "ios-text-input-composition-sync",
     "ios-hardware-keyboard-native-repeat",
     "ios-text-input-view-lifecycle",
-    "ios-text-input-caret-geometry"
+    "ios-text-input-caret-geometry",
+    "flush-coroutine-dispatcher-reentrancy"
   ],
   "publications": [
     {

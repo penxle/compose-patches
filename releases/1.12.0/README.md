@@ -33,6 +33,9 @@ Apply these after the August baseline, in order:
 4. `ios-text-input-caret-geometry`: deliver actual caret and text-range rectangles
    to the Compose-rendered UIKit input view and notify UIKit about scrolling.
    Typie supplies range geometry from its Rust layout and removes its field-frame workaround.
+5. `flush-coroutine-dispatcher-reentrancy`: remove queued tasks before executing
+   them and preserve the outer running state across nested flushes. This prevents
+   synchronous frame requests from executing a completed coroutine again.
 
 The first follow-up can be applied without the second. The second patch is based
 on the first, including its input-test fixture. The lifecycle patch is
@@ -42,6 +45,9 @@ Typie's request wrapper that consumes its API.
 The caret-geometry patch can be removed independently, together with reverting
 Typie's range callback and restoring its field-frame workaround.
 
+The dispatcher patch is independent of the input patches and can be removed separately.
+It changes shared iOS/Desktop source; this release publishes only iOS artifacts.
+
 The consolidation of the first two follow-ups produced exactly the same source
 files and tests as the previous seven-patch release plus the reviewed,
 uncommitted reentrant-flush patch.
@@ -50,9 +56,9 @@ published patch revisions remain in Git history; they are not rewritten.
 
 ## Source rollback
 
-To restore the August source baseline, remove all four September follow-up IDs from
+To restore the August source baseline, remove all five September follow-up IDs from
 `release.json`, leaving the first four IDs unchanged. When reversing patches in
-an already-patched checkout, reverse caret geometry first, then lifecycle and hardware handling,
+an already-patched checkout, reverse the dispatcher patch and caret geometry first, then lifecycle and hardware handling,
 then IME synchronization.
 After removing lifecycle handling, hardware handling can also be removed while
 leaving the IME fixes available.

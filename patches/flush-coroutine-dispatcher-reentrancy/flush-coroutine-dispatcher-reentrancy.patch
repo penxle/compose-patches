@@ -1,0 +1,107 @@
+diff --git a/compose/ui/ui/src/skikoMain/kotlin/androidx/compose/ui/platform/FlushCoroutineDispatcher.skiko.kt b/compose/ui/ui/src/skikoMain/kotlin/androidx/compose/ui/platform/FlushCoroutineDispatcher.skiko.kt
+index 98a109590ce..15cf7bcaf18 100644
+--- a/compose/ui/ui/src/skikoMain/kotlin/androidx/compose/ui/platform/FlushCoroutineDispatcher.skiko.kt
++++ b/compose/ui/ui/src/skikoMain/kotlin/androidx/compose/ui/platform/FlushCoroutineDispatcher.skiko.kt
+@@ -41,11 +41,10 @@ internal class FlushCoroutineDispatcher(
+     // use this dispatcher won't be properly cancelled.
+     // TODO replace it by scope.coroutineContext[CoroutineDispatcher] when it will be no longer experimental
+     private val scope = CoroutineScope(scope.coroutineContext.minusKey(Job))
+-    private var immediateTasks = ArrayDeque<Runnable>()
++    private val immediateTasks = ArrayDeque<Runnable>()
+     private val delayedTasks = ArrayDeque<Runnable>()
+     private val immediateTasksLock = makeSynchronizedObject()
+     private val delayedTasksLock = makeSynchronizedObject()
+-    private var immediateTasksSwap = ArrayDeque<Runnable>()
+     @Volatile
+     private var isPerformingRun = false
+     private val runLock = makeSynchronizedObject()
+@@ -87,30 +86,23 @@ internal class FlushCoroutineDispatcher(
+      * performing in the [scope].
+      */
+     fun flush() = performRun {
+-        // Run tasks until they're empty in order to executed even ones that are added by the tasks
+-        // pending at the start
++        // Remove each task before running it because it may reenter flush.
+         while (true) {
+-            synchronized(immediateTasksLock) {
+-                if (immediateTasks.isEmpty())
+-                    return@performRun
+-
+-                val tmp = immediateTasksSwap
+-                immediateTasksSwap = immediateTasks
+-                immediateTasks = tmp
+-            }
+-
+-            immediateTasksSwap.forEach(Runnable::run)
+-            immediateTasksSwap.clear()
++            val task = synchronized(immediateTasksLock) {
++                immediateTasks.removeFirstOrNull()
++            } ?: return@performRun
++            task.run()
+         }
+     }
+ 
+     // the lock is needed to be certain that all tasks will be completed after `flush` method
+     private fun performRun(body: () -> Unit) = synchronized(runLock) {
++        val wasPerformingRun = isPerformingRun
+         try {
+             isPerformingRun = true
+             body()
+         } finally {
+-            isPerformingRun = false
++            isPerformingRun = wasPerformingRun
+         }
+     }
+ 
+diff --git a/compose/ui/ui/src/skikoTest/kotlin/androidx/compose/ui/platform/FlushCoroutineDispatcherTest.kt b/compose/ui/ui/src/skikoTest/kotlin/androidx/compose/ui/platform/FlushCoroutineDispatcherTest.kt
+index 6702ba52496..006250ca5e0 100644
+--- a/compose/ui/ui/src/skikoTest/kotlin/androidx/compose/ui/platform/FlushCoroutineDispatcherTest.kt
++++ b/compose/ui/ui/src/skikoTest/kotlin/androidx/compose/ui/platform/FlushCoroutineDispatcherTest.kt
+@@ -29,6 +29,47 @@ import kotlinx.coroutines.channels.Channel
+ 
+ class FlushCoroutineDispatcherTest {
+ 
++    @Test
++    fun reentrant_flush_runs_each_queued_task_once_in_order() = runTest {
++        val dispatcher = FlushCoroutineDispatcher(this)
++        val events = mutableListOf<String>()
++        var firstTaskRuns = 0
++        dispatcher.dispatch(EmptyCoroutineContext, Runnable {
++            firstTaskRuns++
++            // Keep a regression from recursively running the test without bound.
++            if (firstTaskRuns > 1) return@Runnable
++            events.add("first:start")
++            dispatcher.dispatch(EmptyCoroutineContext, Runnable { events.add("nested") })
++            dispatcher.flush()
++            events.add("first:end")
++        })
++        dispatcher.dispatch(EmptyCoroutineContext, Runnable { events.add("second") })
++
++        dispatcher.flush()
++        testScheduler.advanceUntilIdle()
++
++        assertEquals(1, firstTaskRuns)
++        assertEquals(listOf("first:start", "second", "nested", "first:end"), events)
++        assertFalse(dispatcher.hasImmediateTasks())
++    }
++
++    @Test
++    fun reentrant_flush_keeps_the_outer_task_running_until_it_returns() = runTest {
++        val dispatcher = FlushCoroutineDispatcher(this)
++        var runningAfterNestedFlush = false
++        dispatcher.dispatch(EmptyCoroutineContext, Runnable {
++            dispatcher.flush()
++            runningAfterNestedFlush = dispatcher.hasImmediateTasks()
++        })
++
++        dispatcher.flush()
++
++        assertTrue(runningAfterNestedFlush)
++        assertFalse(dispatcher.hasImmediateTasks())
++        testScheduler.advanceUntilIdle()
++        assertFalse(dispatcher.hasImmediateTasks())
++    }
++
+     @Test
+     fun all_tasks_should_run_with_flush() = runTest {
+         val dispatcher = FlushCoroutineDispatcher(this)
