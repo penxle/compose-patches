@@ -2,8 +2,9 @@ import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.api.publish.PublishingExtension
 import org.gradle.kotlin.dsl.configure
 
-val githubActor = System.getenv("GITHUB_ACTOR") ?: error("GITHUB_ACTOR is required")
-val githubToken = System.getenv("GITHUB_TOKEN") ?: error("GITHUB_TOKEN is required")
+val localRepository = gradle.startParameter.projectProperties["composePatchesRepository"]
+val githubActor = System.getenv("GITHUB_ACTOR")
+val githubToken = System.getenv("GITHUB_TOKEN")
 val patchProvenanceSha256 =
     System.getenv("PATCH_PROVENANCE_SHA256")
         ?.takeIf { it.matches(Regex("[0-9a-f]{64}")) }
@@ -18,10 +19,12 @@ gradle.beforeProject {
             repositories {
                 maven {
                     name = "GitHubPackages"
-                    url = uri("https://maven.pkg.github.com/penxle/compose-patches")
-                    credentials {
-                        username = githubActor
-                        password = githubToken
+                    url = uri(localRepository ?: "https://maven.pkg.github.com/penxle/compose-patches")
+                    if (localRepository == null) {
+                        credentials {
+                            username = githubActor ?: error("GITHUB_ACTOR is required")
+                            password = githubToken ?: error("GITHUB_TOKEN is required")
+                        }
                     }
                 }
             }

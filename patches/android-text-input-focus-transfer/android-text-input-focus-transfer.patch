@@ -1,0 +1,476 @@
+diff --git a/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidCursorAnchorInfoTest.kt b/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidCursorAnchorInfoTest.kt
+index 715d5f06..6bf9e3de 100644
+--- a/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidCursorAnchorInfoTest.kt
++++ b/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidCursorAnchorInfoTest.kt
+@@ -107,7 +107,8 @@ class TextInputServiceAndroidCursorAnchorInfoTest {
+                 view,
+                 positionCalculator,
+                 inputMethodManager,
+-                inputCommandProcessorExecutor = choreographer.asExecutor(),
++                afterFrameCommandExecutor = choreographer.asExecutor(),
++                nextFrameCommandExecutor = choreographer.asExecutor(),
+             )
+         textInputService.startInput(
+             value = TextFieldValue(""),
+diff --git a/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidEmojiTest.kt b/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidEmojiTest.kt
+index f6edc072..9dab8289 100644
+--- a/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidEmojiTest.kt
++++ b/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidEmojiTest.kt
+@@ -61,7 +61,8 @@ class TextInputServiceAndroidEmojiTest {
+                 view,
+                 positionCalculator,
+                 inputMethodManager,
+-                inputCommandProcessorExecutor = choreographer.asExecutor(),
++                afterFrameCommandExecutor = choreographer.asExecutor(),
++                nextFrameCommandExecutor = choreographer.asExecutor(),
+             )
+ 
+         textInputService.startInput(TextFieldValue(""), ImeOptions.Default, {}, {})
+diff --git a/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidOnStateUpdateTest.kt b/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidOnStateUpdateTest.kt
+index 8cf04db3..014ca19d 100644
+--- a/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidOnStateUpdateTest.kt
++++ b/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/input/TextInputServiceAndroidOnStateUpdateTest.kt
+@@ -62,7 +62,8 @@ class TextInputServiceAndroidOnStateUpdateTest {
+                 view,
+                 mock(),
+                 inputMethodManager,
+-                inputCommandProcessorExecutor = neverExecutor,
++                afterFrameCommandExecutor = neverExecutor,
++                nextFrameCommandExecutor = neverExecutor,
+             )
+         textInputService.startInput(
+             value = TextFieldValue(""),
+diff --git a/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/text/input/PlatformTextInputViewIntegrationTest.kt b/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/text/input/PlatformTextInputViewIntegrationTest.kt
+index e3501b20..aeea5568 100644
+--- a/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/text/input/PlatformTextInputViewIntegrationTest.kt
++++ b/compose/ui/ui/src/androidDeviceTest/kotlin/androidx/compose/ui/text/input/PlatformTextInputViewIntegrationTest.kt
+@@ -27,6 +27,8 @@ import androidx.compose.foundation.focusable
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.ui.AndroidComposeUiFlags
++import androidx.compose.ui.ExperimentalComposeUiApi
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.focus.FocusEventModifierNode
+ import androidx.compose.ui.focus.FocusState
+@@ -56,6 +58,7 @@ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.awaitCancellation
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.test.StandardTestDispatcher
++import org.junit.Assume.assumeTrue
+ import org.junit.Rule
+ import org.junit.Test
+ import org.junit.runner.RunWith
+@@ -646,7 +649,8 @@ class PlatformTextInputViewIntegrationTest {
+                 view = (original as TextInputServiceAndroid).view,
+                 rootPositionCalculator = FakeMatrixPositionCalculator,
+                 inputMethodManager = inputMethodManager,
+-                inputCommandProcessorExecutor = original.inputCommandProcessorExecutor,
++                afterFrameCommandExecutor = original.afterFrameCommandExecutor,
++                nextFrameCommandExecutor = original.nextFrameCommandExecutor,
+             )
+         }
+         rule.setContent {
+@@ -687,7 +691,8 @@ class PlatformTextInputViewIntegrationTest {
+                 view = (original as TextInputServiceAndroid).view,
+                 rootPositionCalculator = FakeMatrixPositionCalculator,
+                 inputMethodManager = inputMethodManager,
+-                original.inputCommandProcessorExecutor,
++                original.afterFrameCommandExecutor,
++                original.nextFrameCommandExecutor,
+             )
+         }
+         rule.setContent {
+@@ -711,6 +716,47 @@ class PlatformTextInputViewIntegrationTest {
+         }
+     }
+ 
++    @OptIn(ExperimentalComposeUiApi::class)
++    @Suppress("DEPRECATION")
++    @Test
++    fun focusSwitchBetweenTestNodes_undispatched_doesNotHideKeyboard() {
++        assumeTrue(AndroidComposeUiFlags.isOutOfFrameSchedulerForTextInputEventsEnabled)
++        val inputMethodManager = TestInputMethodManager()
++        platformTextInputServiceInterceptor = { original ->
++            val origAndroid = original as TextInputServiceAndroid
++            TextInputServiceAndroid(
++                view = origAndroid.view,
++                rootPositionCalculator = FakeMatrixPositionCalculator,
++                inputMethodManager = inputMethodManager,
++                afterFrameCommandExecutor = origAndroid.afterFrameCommandExecutor,
++                nextFrameCommandExecutor = origAndroid.nextFrameCommandExecutor,
++            )
++        }
++        rule.setContent {
++            Column {
++                Box(
++                    TestElement(CoroutineStart.UNDISPATCHED) { node1 = it }
++                        .focusable()
++                        .testTag("tag1")
++                )
++                Box(
++                    TestElement(CoroutineStart.UNDISPATCHED) { node2 = it }
++                        .focusable()
++                        .testTag("tag2")
++                )
++            }
++        }
++
++        rule.onNodeWithTag("tag1").requestFocus()
++        rule.waitForIdle()
++        inputMethodManager.reset()
++
++        rule.onNodeWithTag("tag2").requestFocus()
++        rule.waitForIdle()
++
++        assertThat(inputMethodManager.hideKeyboardCalls).isEqualTo(0)
++    }
++
+     private fun setupContent() {
+         rule.setContent {
+             hostView = LocalView.current as AndroidComposeView
+@@ -721,23 +767,28 @@ class PlatformTextInputViewIntegrationTest {
+         }
+     }
+ 
+-    private data class TestElement(val onNode: (PlatformTextInputModifierNode) -> Unit) :
+-        ModifierNodeElement<TestNode>() {
+-        override fun create(): TestNode = TestNode(onNode)
++    private data class TestElement(
++        val start: CoroutineStart = CoroutineStart.DEFAULT,
++        val onNode: (PlatformTextInputModifierNode) -> Unit,
++    ) : ModifierNodeElement<TestNode>() {
++        override fun create(): TestNode = TestNode(start, onNode)
+ 
+         override fun update(node: TestNode) {
++            node.start = start
+             node.onNode = onNode
+         }
+     }
+ 
+-    private class TestNode(var onNode: (PlatformTextInputModifierNode) -> Unit) :
+-        Modifier.Node(), PlatformTextInputModifierNode, FocusEventModifierNode {
++    private class TestNode(
++        var start: CoroutineStart = CoroutineStart.DEFAULT,
++        var onNode: (PlatformTextInputModifierNode) -> Unit,
++    ) : Modifier.Node(), PlatformTextInputModifierNode, FocusEventModifierNode {
+ 
+         private var inputSessionJob: Job? = null
+ 
+         private fun startInputSession() {
+             inputSessionJob =
+-                coroutineScope.launch {
++                coroutineScope.launch(start = start) {
+                     establishTextInputSession {
+                         launch {
+                             startInputMethod(
+diff --git a/compose/ui/ui/src/androidHostTest/kotlin/androidx/compose/ui/text/input/TextInputServiceAndroidCommandDebouncingTest.kt b/compose/ui/ui/src/androidHostTest/kotlin/androidx/compose/ui/text/input/TextInputServiceAndroidCommandDebouncingTest.kt
+index 7ee28588..07bce711 100644
+--- a/compose/ui/ui/src/androidHostTest/kotlin/androidx/compose/ui/text/input/TextInputServiceAndroidCommandDebouncingTest.kt
++++ b/compose/ui/ui/src/androidHostTest/kotlin/androidx/compose/ui/text/input/TextInputServiceAndroidCommandDebouncingTest.kt
+@@ -21,6 +21,8 @@ package androidx.compose.ui.text.input
+ import android.view.View
+ import android.view.inputmethod.CursorAnchorInfo
+ import android.view.inputmethod.ExtractedText
++import androidx.compose.ui.AndroidComposeUiFlags
++import androidx.compose.ui.ExperimentalComposeUiApi
+ import com.google.common.truth.Truth.assertThat
+ import java.util.concurrent.Executor
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+@@ -31,6 +33,7 @@ import kotlinx.coroutines.test.StandardTestDispatcher
+ import kotlinx.coroutines.test.TestScope
+ import kotlinx.coroutines.test.advanceUntilIdle
+ import org.junit.After
++import org.junit.Assume.assumeTrue
+ import org.junit.Before
+ import org.junit.Test
+ import org.mockito.kotlin.mock
+@@ -48,7 +51,8 @@ class TextInputServiceAndroidCommandDebouncingTest {
+             view,
+             mock(),
+             inputMethodManager,
+-            inputCommandProcessorExecutor = executor,
++            afterFrameCommandExecutor = executor,
++            nextFrameCommandExecutor = executor,
+         )
+     private val dispatcher = StandardTestDispatcher()
+     private val scope = TestScope(dispatcher + Job())
+@@ -291,6 +295,134 @@ class TextInputServiceAndroidCommandDebouncingTest {
+         assertThat(inputMethodManager.showSoftInputCalls).isEqualTo(2)
+     }
+ 
++    @OptIn(ExperimentalComposeUiApi::class)
++    @Test
++    fun stopThenStartInput_staysOnNextFrameRunner() {
++        assumeTrue(AndroidComposeUiFlags.isOutOfFrameSchedulerForTextInputEventsEnabled)
++        var afterFrameRuns = 0
++        var nextFrameRuns = 0
++        val afterFrameExecutor = Executor { runnable ->
++            afterFrameRuns++
++            scope.launch { runnable.run() }
++        }
++        val nextFrameExecutor = Executor { runnable ->
++            nextFrameRuns++
++            scope.launch { runnable.run() }
++        }
++        val serviceWithRunners =
++            TextInputServiceAndroid(
++                view,
++                mock(),
++                inputMethodManager,
++                afterFrameCommandExecutor = afterFrameExecutor,
++                nextFrameCommandExecutor = nextFrameExecutor,
++            )
++
++        serviceWithRunners.stopInput()
++        assertThat(nextFrameRuns).isEqualTo(1)
++        assertThat(afterFrameRuns).isEqualTo(0)
++
++        serviceWithRunners.startInputForTest()
++        assertThat(afterFrameRuns).isEqualTo(0)
++
++        scope.advanceUntilIdle()
++
++        assertThat(inputMethodManager.restartCalls).isEqualTo(1)
++        assertThat(inputMethodManager.hideSoftInputCalls).isEqualTo(0)
++    }
++
++    @OptIn(ExperimentalComposeUiApi::class)
++    @Test
++    fun startThenStopThenStartInput_withoutAdvancing_isDispatchedToNextFrameRunner() {
++        assumeTrue(AndroidComposeUiFlags.isOutOfFrameSchedulerForTextInputEventsEnabled)
++        var afterFrameRunnable: Runnable? = null
++        var nextFrameRunnable: Runnable? = null
++        val afterFrameExecutor = Executor { runnable -> afterFrameRunnable = runnable }
++        val nextFrameExecutor = Executor { runnable -> nextFrameRunnable = runnable }
++        val serviceWithRunners =
++            TextInputServiceAndroid(
++                view,
++                mock(),
++                inputMethodManager,
++                afterFrameCommandExecutor = afterFrameExecutor,
++                nextFrameCommandExecutor = nextFrameExecutor,
++            )
++
++        // 1. startInput: scheduled on after-frame runner
++        serviceWithRunners.startInputForTest()
++        assertThat(afterFrameRunnable).isNotNull()
++        assertThat(nextFrameRunnable).isNull()
++
++        // 2. stopInput without running the after-frame runnable: demotes to next-frame runner
++        serviceWithRunners.stopInput()
++        assertThat(nextFrameRunnable).isNotNull()
++
++        // 3. startInput without running runnables: remains on next-frame runner
++        serviceWithRunners.startInputForTest()
++
++        val afterFrame = requireNotNull(afterFrameRunnable)
++        val nextFrame = requireNotNull(nextFrameRunnable)
++
++        // 4. Executing the after-frame runnable is a no-op (skipped because frameCallback was
++        // replaced)
++        afterFrame.run()
++        assertThat(inputMethodManager.restartCalls).isEqualTo(0)
++        assertThat(inputMethodManager.showSoftInputCalls).isEqualTo(0)
++        assertThat(inputMethodManager.hideSoftInputCalls).isEqualTo(0)
++
++        // 5. Executing the next-frame runnable processes the batched commands
++        nextFrame.run()
++        assertThat(inputMethodManager.restartCalls).isEqualTo(1)
++        assertThat(inputMethodManager.showSoftInputCalls).isEqualTo(1)
++        assertThat(inputMethodManager.hideSoftInputCalls).isEqualTo(0)
++
++        // 6. Running next-frame or after-frame runnable again is a no-op
++        afterFrame.run()
++        nextFrame.run()
++        assertThat(inputMethodManager.restartCalls).isEqualTo(1)
++        assertThat(inputMethodManager.showSoftInputCalls).isEqualTo(1)
++        assertThat(inputMethodManager.hideSoftInputCalls).isEqualTo(0)
++    }
++
++    @OptIn(ExperimentalComposeUiApi::class)
++    @Test
++    fun whenOutOfFrameSchedulerFlagIsDisabled_startInputDispatchesToNextFrameRunner() {
++        val previousFlag = AndroidComposeUiFlags.isOutOfFrameSchedulerForTextInputEventsEnabled
++        try {
++            AndroidComposeUiFlags.isOutOfFrameSchedulerForTextInputEventsEnabled = false
++
++            var afterFrameRuns = 0
++            var nextFrameRuns = 0
++            val afterFrameExecutor = Executor { runnable ->
++                afterFrameRuns++
++                scope.launch { runnable.run() }
++            }
++            val nextFrameExecutor = Executor { runnable ->
++                nextFrameRuns++
++                scope.launch { runnable.run() }
++            }
++            val serviceWithRunners =
++                TextInputServiceAndroid(
++                    view,
++                    mock(),
++                    inputMethodManager,
++                    afterFrameCommandExecutor = afterFrameExecutor,
++                    nextFrameCommandExecutor = nextFrameExecutor,
++                )
++
++            serviceWithRunners.startInputForTest()
++            assertThat(nextFrameRuns).isEqualTo(1)
++            assertThat(afterFrameRuns).isEqualTo(0)
++
++            scope.advanceUntilIdle()
++
++            assertThat(inputMethodManager.restartCalls).isEqualTo(1)
++            assertThat(inputMethodManager.showSoftInputCalls).isEqualTo(1)
++        } finally {
++            AndroidComposeUiFlags.isOutOfFrameSchedulerForTextInputEventsEnabled = previousFlag
++        }
++    }
++
+     private fun TextInputServiceAndroid.startInputForTest() {
+         startInput(
+             TextFieldValue(),
+diff --git a/compose/ui/ui/src/androidMain/kotlin/androidx/compose/ui/platform/AndroidComposeView.android.kt b/compose/ui/ui/src/androidMain/kotlin/androidx/compose/ui/platform/AndroidComposeView.android.kt
+index 456a03ac..cf56db3b 100644
+--- a/compose/ui/ui/src/androidMain/kotlin/androidx/compose/ui/platform/AndroidComposeView.android.kt
++++ b/compose/ui/ui/src/androidMain/kotlin/androidx/compose/ui/platform/AndroidComposeView.android.kt
+@@ -768,14 +768,11 @@ internal class AndroidComposeView(context: Context, composeViewContext: ComposeV
+         get() =
+             _legacyTextInputServiceAndroid
+                 ?: TextInputServiceAndroid(
+-                        view,
+                         this,
+-                        @OptIn(ExperimentalComposeUiApi::class)
+-                        if (AndroidComposeUiFlags.isOutOfFrameSchedulerForTextInputEventsEnabled) {
+-                            Executor { outOfFrameExecutor?.schedule(it::run) }
+-                        } else {
+-                            Executor(::postOnAnimation)
+-                        },
++                        this,
++                        afterFrameCommandExecutor =
++                            Executor { outOfFrameExecutor?.schedule(it::run) },
++                        nextFrameCommandExecutor = Executor(::postOnAnimation),
+                     )
+                     .also { _legacyTextInputServiceAndroid = it }
+ 
+diff --git a/compose/ui/ui/src/androidMain/kotlin/androidx/compose/ui/text/input/TextInputServiceAndroid.android.kt b/compose/ui/ui/src/androidMain/kotlin/androidx/compose/ui/text/input/TextInputServiceAndroid.android.kt
+index 407dbce6..60a6cc93 100644
+--- a/compose/ui/ui/src/androidMain/kotlin/androidx/compose/ui/text/input/TextInputServiceAndroid.android.kt
++++ b/compose/ui/ui/src/androidMain/kotlin/androidx/compose/ui/text/input/TextInputServiceAndroid.android.kt
+@@ -28,6 +28,8 @@ import android.view.inputmethod.BaseInputConnection
+ import android.view.inputmethod.EditorInfo
+ import android.view.inputmethod.InputConnection
+ import androidx.compose.runtime.collection.mutableVectorOf
++import androidx.compose.ui.AndroidComposeUiFlags
++import androidx.compose.ui.ExperimentalComposeUiApi
+ import androidx.compose.ui.geometry.Rect
+ import androidx.compose.ui.graphics.Matrix
+ import androidx.compose.ui.input.pointer.MatrixPositionCalculator
+@@ -48,25 +50,33 @@ private const val DEBUG_CLASS = "TextInputServiceAndroid"
+ /**
+  * Provide Android specific input service with the Operating System.
+  *
+- * @param inputCommandProcessorExecutor [Executor] used to schedule the [processInputCommands]
+- *   function when a input command is first requested for a frame.
++ * Two executors are used to schedule [processInputCommands] so that commands requiring low-latency
++ * responses (e.g. showing the keyboard) can be dispatched immediately out-of-frame, while cleanup
++ * commands (e.g. stopping input) are delayed to the animation frame so a subsequent start command
++ * can override them during focus transfers.
++ *
++ * @param afterFrameCommandExecutor [Executor] used to schedule immediate out-of-frame execution of
++ *   commands that require low-latency responses.
++ * @param nextFrameCommandExecutor [Executor] used to delay cleanup commands to the next animation
++ *   frame.
+  */
+ internal class TextInputServiceAndroid(
+     val view: View,
+     rootPositionCalculator: MatrixPositionCalculator,
+     private val inputMethodManager: InputMethodManager,
+-    val inputCommandProcessorExecutor: Executor,
++    val afterFrameCommandExecutor: Executor,
++    val nextFrameCommandExecutor: Executor,
+ ) : PlatformTextInputService {
+ 
+     /**
+      * Commands that can be sent into [textInputCommandQueue] to be processed by
+      * [processInputCommands].
+      */
+-    private enum class TextInputCommand {
+-        StartInput,
+-        StopInput,
+-        ShowKeyboard,
+-        HideKeyboard,
++    private enum class TextInputCommand(val preferImmediateDispatch: Boolean) {
++        StartInput(true),
++        StopInput(false),
++        ShowKeyboard(true),
++        HideKeyboard(false),
+     }
+ 
+     /**
+@@ -111,12 +121,20 @@ internal class TextInputServiceAndroid(
+      */
+     private val textInputCommandQueue = mutableVectorOf<TextInputCommand>()
+     private var frameCallback: Runnable? = null
++    private var scheduledForImmediateDispatch = false
+ 
+     constructor(
+         view: View,
+         positionCalculator: MatrixPositionCalculator,
+-        executor: Executor,
+-    ) : this(view, positionCalculator, InputMethodManagerImpl(view), executor)
++        afterFrameCommandExecutor: Executor,
++        nextFrameCommandExecutor: Executor,
++    ) : this(
++        view,
++        positionCalculator,
++        InputMethodManagerImpl(view),
++        afterFrameCommandExecutor,
++        nextFrameCommandExecutor,
++    )
+ 
+     init {
+         if (DEBUG) {
+@@ -253,13 +271,38 @@ internal class TextInputServiceAndroid(
+     private fun sendInputCommand(command: TextInputCommand) {
+         textInputCommandQueue += command
+         if (frameCallback == null) {
+-            frameCallback =
+-                Runnable {
++            @OptIn(ExperimentalComposeUiApi::class)
++            val preferImmediateDispatch =
++                AndroidComposeUiFlags.isOutOfFrameSchedulerForTextInputEventsEnabled &&
++                    command.preferImmediateDispatch
++            scheduleInputCommandProcessing(preferImmediate = preferImmediateDispatch)
++        } else if (scheduledForImmediateDispatch && !command.preferImmediateDispatch) {
++            // An after-frame dispatch was scheduled, but a cleanup command (e.g. StopInput) arrived
++            // before it ran. Demote to next-frame dispatch so cleanup commands are deferred to the
++            // animation frame.
++            scheduleInputCommandProcessing(preferImmediate = false)
++        }
++    }
++
++    private fun scheduleInputCommandProcessing(preferImmediate: Boolean) {
++        scheduledForImmediateDispatch = preferImmediate
++        val runner =
++            if (preferImmediate) {
++                afterFrameCommandExecutor
++            } else {
++                nextFrameCommandExecutor
++            }
++        frameCallback =
++            object : Runnable {
++                override fun run() {
++                    if (frameCallback === this) {
+                         frameCallback = null
++                        scheduledForImmediateDispatch = false
+                         processInputCommands()
+                     }
+-                    .also(inputCommandProcessorExecutor::execute)
+-        }
++                }
++            }
++        runner.execute(frameCallback)
+     }
+ 
+     private fun processInputCommands() {

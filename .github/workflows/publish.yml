@@ -52,8 +52,11 @@ jobs:
               type == "object" and
               (.upstream_repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
               (.upstream_commit | type == "string" and test("^[0-9a-f]{40}$")) and
-              (.version_property | type == "string" and test("^[A-Za-z0-9_.-]+$")) and
-              (.version | type == "string" and . == $release) and
+              ((has("version_property") | not) or
+                (.version_property | type == "string" and test("^[A-Za-z0-9_.-]+$"))) and
+              (.version | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+              ((has("gradle_project_directory") | not) or
+                (.gradle_project_directory | type == "string" and test("^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$"))) and
               (.patches | type == "array" and length > 0 and
                 all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
                 length == (unique | length)) and
@@ -194,7 +197,8 @@ jobs:
           {
             echo "upstream_repository=$(jq -r '.upstream_repository' "$manifest")"
             echo "upstream_commit=$(jq -r '.upstream_commit' "$manifest")"
-            echo "version_property=$(jq -r '.version_property' "$manifest")"
+            echo "version_property=$(jq -r '.version_property // empty' "$manifest")"
+            echo "gradle_project_directory=$(jq -r '.gradle_project_directory // "."' "$manifest")"
             echo "version=$(jq -r '.version' "$manifest")"
             echo "patches=$(jq -c '.patches' "$manifest")"
           } >> "$GITHUB_OUTPUT"
@@ -208,12 +212,28 @@ jobs:
           persist-credentials: false
 
       - name: Select Xcode
+        if: steps.release.outputs.upstream_repository == 'JetBrains/compose-multiplatform-core'
         run: |
           # Compose 1.12.0 compiles CMPUIKitUtils against unguarded iOS 26 SDK symbols, so the
           # image default Xcode is not enough. Upstream selects the same toolchain explicitly in
           # .github/actions/setup-xcode.
           sudo xcode-select -s /Applications/Xcode_26.5.app
           xcodebuild -version
+
+      - name: Set up Java for AndroidX
+        if: steps.release.outputs.upstream_repository == 'androidx/androidx'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        if: steps.release.outputs.upstream_repository == 'androidx/androidx'
+        uses: android-actions/setup-android@v3
+
+      - name: Install AndroidX SDK requirements
+        if: steps.release.outputs.upstream_repository == 'androidx/androidx'
+        run: sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "ndk;27.0.12077973"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
@@ -238,7 +258,7 @@ jobs:
           done < <(jq -r '.[]' <<< "$PATCHES")
 
       - name: Verify patches
-        working-directory: upstream
+        working-directory: upstream/${{ steps.release.outputs.gradle_project_directory }}
         env:
           PATCHES: ${{ steps.release.outputs.patches }}
         run: |
@@ -301,7 +321,7 @@ jobs:
           done < <(jq -c '.[]' <<< "$REPLACEMENTS")
 
       - name: Publish patched artifacts
-        working-directory: upstream
+        working-directory: upstream/${{ steps.release.outputs.gradle_project_directory }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PATCH_PROVENANCE_SHA256: ${{ matrix.provenance_sha256 }}
@@ -311,5 +331,7 @@ jobs:
         run: |
           tasks=()
           while IFS= read -r task; do tasks+=("$task"); done < <(jq -r '.[]' <<< "$PUBLISH_TASKS")
-          ./gradlew "${tasks[@]}" "-P$VERSION_PROPERTY=$VERSION" --no-configuration-cache --no-configure-on-demand \
+          version_args=()
+          if [[ -n "$VERSION_PROPERTY" ]]; then version_args+=("-P$VERSION_PROPERTY=$VERSION"); fi
+          ./gradlew "${tasks[@]}" "${version_args[@]}" --no-configuration-cache --no-configure-on-demand \
             -I "$GITHUB_WORKSPACE/gradle/publish.init.gradle.kts"

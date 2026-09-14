@@ -3,7 +3,7 @@
 Compose patches used by [Typie](https://github.com/penxle/typie).
 
 - `patches/`: independent patch files and provenance
-- `releases/`: ordered patch sets and publication configuration
+- `releases/`: ordered patch sets and publication configuration; release IDs may differ from Maven versions
 - `.github/workflows/publish.yml`: publishes missing or changed releases after a push to `main`
 - Maven registry: `https://maven.pkg.github.com/penxle/compose-patches`
 
@@ -17,3 +17,14 @@ artifacts.
 
 Merge the change into `main`. The workflow publishes missing publications and replaces publications whose release configuration or patch contents have
 changed.
+
+## Android and iOS releases
+
+`releases/1.12.0` builds the JetBrains iOS patches. `releases/androidx-1.12.0` builds
+AndroidX Compose UI from its own release commit. A release may set
+`gradle_project_directory` to use a standalone upstream build, and
+`version_property` only when its upstream needs a publication-version override.
+
+For local verification, the publication init script accepts
+`-PcomposePatchesRepository=/absolute/path/to/maven-repository`. It uses the same
+publication tasks and provenance property without GitHub credentials.
