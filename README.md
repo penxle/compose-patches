@@ -18,6 +18,11 @@ artifacts.
 Merge the change into `main`. The workflow publishes missing publications and replaces publications whose release configuration or patch contents have
 changed.
 
+Verification commands use one fully qualified Gradle task followed by optional `--tests PATTERN` pairs.
+CI merges repeated tasks and test patterns into one Gradle invocation; an unfiltered task retains full test coverage.
+It prepares all publication files in a local Maven repository before deleting replaced package versions, so compilation and metadata generation
+finish before the registry is changed. The final step publishes those prepared build outputs through Gradle.
+
 ## Android and iOS releases
 
 `releases/1.12.0` builds the JetBrains iOS patches. `releases/androidx-1.12.0` builds

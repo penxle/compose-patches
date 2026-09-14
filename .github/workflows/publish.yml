@@ -29,6 +29,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test publication scripts
+        run: python3 -m unittest discover -s .github/scripts
+
       - name: Find unpublished or changed releases
         id: discover
         env:
@@ -173,7 +176,7 @@ jobs:
     needs: discover
     if: needs.discover.outputs.has_work == 'true'
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -260,16 +263,28 @@ jobs:
       - name: Verify patches
         working-directory: upstream/${{ steps.release.outputs.gradle_project_directory }}
         env:
-          PATCHES: ${{ steps.release.outputs.patches }}
+          RELEASE: ${{ matrix.release }}
         run: |
-          while IFS= read -r patch_id; do
-            manifest="$GITHUB_WORKSPACE/patches/$patch_id/patch.json"
-            while IFS= read -r command; do
-              args=()
-              while IFS= read -r arg; do args+=("$arg"); done < <(jq -r '.[]' <<< "$command")
-              ./gradlew "${args[@]}" --no-configuration-cache --no-configure-on-demand
-            done < <(jq -c '.verify_commands[]' "$manifest")
-          done < <(jq -r '.[]' <<< "$PATCHES")
+          arguments="$(python3 "$GITHUB_WORKSPACE/.github/scripts/verification_arguments.py" "$RELEASE")"
+          args=()
+          while IFS= read -r arg; do args+=("$arg"); done < <(jq -r '.[]' <<< "$arguments")
+          ./gradlew "${args[@]}" --no-configuration-cache --no-configure-on-demand
+
+      - name: Prepare patched artifacts
+        working-directory: upstream/${{ steps.release.outputs.gradle_project_directory }}
+        env:
+          PATCH_PROVENANCE_SHA256: ${{ matrix.provenance_sha256 }}
+          PUBLISH_TASKS: ${{ toJSON(matrix.publish_tasks) }}
+          VERSION: ${{ steps.release.outputs.version }}
+          VERSION_PROPERTY: ${{ steps.release.outputs.version_property }}
+        run: |
+          tasks=()
+          while IFS= read -r task; do tasks+=("$task"); done < <(jq -r '.[]' <<< "$PUBLISH_TASKS")
+          version_args=()
+          if [[ -n "$VERSION_PROPERTY" ]]; then version_args+=("-P$VERSION_PROPERTY=$VERSION"); fi
+          ./gradlew "${tasks[@]}" "${version_args[@]}" --no-configuration-cache --no-configure-on-demand \
+            -PcomposePatchesRepository="$RUNNER_TEMP/prepared-maven" \
+            -I "$GITHUB_WORKSPACE/gradle/publish.init.gradle.kts"
 
       - name: Delete replaced package versions
         env:
