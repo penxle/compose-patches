@@ -18,10 +18,12 @@ supply the composing range or the caret's actual height to the Japanese IME.
   through the actual input view frame into local UIKit points.
 - A missing callback retains focused-caret support. A callback that returns no geometry does not
   fall back to a different or stale caret. Rectangles outside the clipping region are unavailable.
-- Limit additional geometry selection notifications to explicit `UIKitTextInputMethodRequest` integrations.
-  Regular Compose text fields still update their frame, but placeholder and first-glyph relayout do not
-  send extra selection changes that interrupt the Korean keyboard's input context.
-- Notify UIKit when the unclipped text origin moves, even after a text edit with unchanged geometry.
+- Limit additional geometry selection notifications to explicit `UIKitTextInputMethodRequest` integrations
+  with a non-null marked composition range, such as Japanese candidate input. A null range does not mean
+  that native composition has ended: Korean combines committed edits without exposing a marked range.
+  Do not reset that input context when wrapping triggers an editor scroll or a later layout pass.
+  Regular Compose text fields and unmarked custom-editor input still update their frame and range geometry.
+- While a marked range is active, notify UIKit when the unclipped text origin moves, even after a text edit with unchanged geometry.
   A custom editor supplies `unclippedTextOffsetInRoot` to expose scrolling independently of the caret.
   Keep suppressing other layout changes caused by IME edits, including delayed field resizing,
   so native caret movement does not receive duplicate selection notifications.
@@ -51,9 +53,16 @@ field-origin changes, zero-width carets, unavailable or clipped geometry, a sing
 equal-width marked-text replacement, delayed native caret/field updates, callback-time text or
 session replacement,
 queries made before pending edits are flushed or rendered frames are published, and preservation
-of Japanese marked text without duplicate edit dispatch. A regular-field regression covers a first Korean
-consonant followed by baseline and width changes across separate layout passes without selection notifications. The initial range test returned `CGRectNull`; the
-initial scroll test received no UIKit geometry notifications.
+of Japanese marked text without duplicate edit dispatch. Regular-field and custom-editor regressions cover
+an unmarked Korean consonant followed by origin and width changes across separate layout passes without
+selection notifications. The custom-editor test fails on the previous patch with two `will`/`did` pairs;
+it passes when geometry refresh requires a marked range. Existing external text/selection notification
+tests remain unchanged. The initial range test returned `CGRectNull`; the initial marked-scroll test
+received no UIKit geometry notifications.
+
+Runtime verification on an iPhone 17 Pro / iOS 26.5 Simulator reproduced separated Korean jamo
+when wrapping triggered an automatic scroll. The same Mac hardware-keyboard input was confirmed
+normal after removing geometry notifications and again with the final marked-range guard.
 
 Physical-device candidate alignment and scroll behavior require separate confirmation; these
 unit tests do not render the system IME candidate window.

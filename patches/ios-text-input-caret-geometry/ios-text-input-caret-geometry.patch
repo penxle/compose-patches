@@ -74,7 +74,7 @@ index e99423c8702..8addf506e56 100644
                  }.collect {
                      currentInputConnection?.onViewGeometryUpdated()
 diff --git a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
-index e066d024f02..cc66ff66a7b 100644
+index e066d024f02..44db326d9da 100644
 --- a/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
 +++ b/compose/ui/ui/src/iosMain/kotlin/androidx/compose/ui/text/input/ComposeTextInputConnection.ios.kt
 @@ -16,14 +16,18 @@
@@ -119,7 +119,7 @@ index e066d024f02..cc66ff66a7b 100644
  
          showMenuOrUpdatePosition = {}
          textInputView.let { view ->
-@@ -109,9 +118,64 @@ internal open class ComposeTextInputConnection(
+@@ -109,9 +118,65 @@ internal open class ComposeTextInputConnection(
      }
  
      override fun onViewGeometryUpdated() {
@@ -133,11 +133,12 @@ index e066d024f02..cc66ff66a7b 100644
 +        // Custom editor origins track scrolling independently of IME edits. Other layout changes
 +        // can be delayed edit results, so suppress their duplicate selection notifications.
 +        val previous = lastGeometry
-+        // Extra geometry notifications belong to explicit UIKit integrations. A regular
-+        // Compose field can shift its text origin while laying out the first typed glyph;
-+        // notifying that change resets UIKit's in-progress Korean input context.
++        // Refresh candidate geometry only for an explicit marked range. UIKit can still be
++        // combining Korean committed edits when composition is null; geometry notifications
++        // then reset that hidden input context, including when an editor scrolls after wrapping.
 +        val notify =
 +            request is UIKitTextInputMethodRequest &&
++                value.composition != null &&
 +                previous != null &&
 +                previous != geometry &&
 +                (previous.third != geometry.third || lastGeometryValue == value)
@@ -276,7 +277,7 @@ index 64375e16be9..f3ecc566b03 100644
      override fun selectionRectsForRange(range: UITextRange): List<*> =
          listOf<UITextSelectionRect>()
 diff --git a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
-index d55160e8c5e..600c58e3f6c 100644
+index d55160e8c5e..04018586fe8 100644
 --- a/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
 +++ b/compose/ui/ui/src/iosTest/kotlin/androidx/compose/ui/text/input/TextInputConnectionIosTest.kt
 @@ -16,6 +16,10 @@
@@ -312,7 +313,7 @@ index d55160e8c5e..600c58e3f6c 100644
  import androidx.compose.ui.window.ComposeTextInputView
  import kotlin.test.Test
  import kotlin.test.assertEquals
-@@ -43,14 +56,435 @@ import kotlinx.cinterop.ExperimentalForeignApi
+@@ -43,14 +56,524 @@ import kotlinx.cinterop.ExperimentalForeignApi
  import kotlinx.cinterop.readValue
  import kotlinx.coroutines.CoroutineScope
  import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -398,6 +399,95 @@ index d55160e8c5e..600c58e3f6c 100644
 +        // BasicTextField's empty placeholder and first glyph can have different baselines.
 +        // A result label can resize the field in a later layout pass for the same edit.
 +        origin += Offset(0f, scale)
++        clip = clip.copy(top = clip.top + scale)
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        field = field.copy(right = field.right - 80f * scale)
++        clip = clip.copy(right = field.right)
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals(
++            emptyList(),
++            notifications,
++            "relayout must not reset UIKit's Korean input context",
++        )
++        assertEquals(field.toDpRect(host.density), inputView.frame.toDpRect())
++
++        inputView.deleteBackward()
++        inputView.insertText("하")
++        runCurrent()
++        assertEquals("하", request.value().text)
++        session.cancelAndJoin()
++    }
++
++    @Test
++    fun customEditorScrollDoesNotInterruptUnmarkedComposition() = runTest {
++        val host = UIView(frame = CGRectMake(0.0, 0.0, 400.0, 600.0))
++        val scale = host.density.density
++        var field by mutableStateOf(Rect(20f * scale, 30f * scale, 320f * scale, 50f * scale))
++        var clip by mutableStateOf(field)
++        var origin by mutableStateOf(Offset(field.left, field.top))
++        val delegate = TestRequest(TextFieldValue())
++        val request =
++            object : PlatformTextInputMethodRequest by delegate, UIKitTextInputMethodRequest {
++                override fun onTextInputViewAttached(view: UIView) = Unit
++                override fun onTextInputViewDetached(view: UIView) = Unit
++                override val textFieldRectInRoot: () -> Rect? = { field }
++                override val textClippingRectInRoot: () -> Rect? = { clip }
++                override val unclippedTextOffsetInRoot: () -> Offset? = { origin }
++            }
++        val notifications = mutableListOf<String>()
++        val inputDelegate =
++            object : NSObject(), UITextInputDelegateProtocol {
++                override fun conversationContext(
++                    context: UIConversationContext?,
++                    didChange: UITextInputProtocol?,
++                ) = Unit
++
++                override fun selectionWillChange(textInput: UITextInputProtocol?) {
++                    notifications += "will"
++                }
++
++                override fun selectionDidChange(textInput: UITextInputProtocol?) {
++                    notifications += "did"
++                }
++
++                override fun textWillChange(textInput: UITextInputProtocol?) {
++                    notifications += "text-will"
++                }
++
++                override fun textDidChange(textInput: UITextInputProtocol?) {
++                    notifications += "text-did"
++                }
++            }
++        val service =
++            UIKitTextInputService(
++                updateView = {},
++                view = host,
++                viewConfiguration = PlatformContext.DefaultViewConfiguration,
++                focusedViewsList = null,
++                onInputStarted = {},
++                focusManager = { null },
++                onHardwareKeyRepeat = {},
++                coroutineContext = backgroundScope.coroutineContext,
++            )
++        val session = backgroundScope.launch { service.startInputMethod(request) }
++        runCurrent()
++        val inputView = host.subviews.filterIsInstance<ComposeTextInputView>().single()
++        inputView.setInputDelegate(inputDelegate)
++
++        // The Korean keyboard uses committed edits too; a null marked range does not mean
++        // that UIKit has finished combining the first consonant and vowel.
++        inputView.insertText("ㅎ")
++        runCurrent()
++        Snapshot.sendApplyNotifications()
++        runCurrent()
++        assertEquals("ㅎ", request.value().text)
++        assertEquals(emptyList(), notifications)
++
++        // A custom editor scrolls after the first consonant wraps onto the next visual line.
++        // UIKit still owns the unmarked composition, including across later layout passes.
++        origin += Offset(0f, -40f * scale)
 +        clip = clip.copy(top = clip.top + scale)
 +        Snapshot.sendApplyNotifications()
 +        runCurrent()
@@ -748,7 +838,7 @@ index d55160e8c5e..600c58e3f6c 100644
      @Test
      fun inputViewLifecycleEnclosesKeyboardPresentationAndDoesNotOutliveConnection() = runTest {
          val events = mutableListOf<String>()
-@@ -779,7 +1213,19 @@ private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMetho
+@@ -779,7 +1302,19 @@ private class TestRequest(initialValue: TextFieldValue) : PlatformTextInputMetho
          TestTextEditingScope(commands).block()
          dispatchedCommands += commands
          fieldValue =
